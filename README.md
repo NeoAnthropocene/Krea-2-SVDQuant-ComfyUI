@@ -12,19 +12,28 @@ License: this project modifies Krea 2 and is distributed under the [Krea 2 Commu
 License Agreement](https://www.krea.ai/krea-2-licensing) - see [LICENSE.md](LICENSE.md).
 Not an official Krea product.
 
-Quantized **Krea 2 Turbo** checkpoints for ComfyUI — about **2x faster** and **a third the
+Quantized **Krea 2** checkpoints for ComfyUI — about **2x faster** and **a third the
 size** of the usual FP8 version, with no calibration dataset needed. Download a
-checkpoint, install the custom nodes, load the included workflow, done.
+checkpoint, install the custom nodes, load the included workflow, done. Works on both
+**Krea 2 Turbo** (distilled, 8 steps) and the **base** release (~50 steps with real CFG);
+the conversion is identical for both, only the sampler settings differ.
 
 Works on **any modern NVIDIA GPU** — INT8/W4A4 tensor cores go back to Turing (RTX
 20-series and up). Benchmarked on an RTX 3090 (Ampere, sm_86), which is the case most
 existing Krea 2 quantization writeups don't cover, since that generation has no FP8 or
 NVFP4 tensor cores at all.
 
+> **Requires a cu130 (CUDA 13) or newer PyTorch build.** ComfyUI disables `comfy_kitchen`'s
+> CUDA backend entirely on older torch builds, which silently drops every quantized
+> checkpoint onto a pure-Python fallback that is *slower than bf16*. If these checkpoints
+> are slower than FP8 for you, this is almost certainly why — see
+> [Troubleshooting](#troubleshooting).
+
 This is an experimental, built-from-scratch project: the quantization script, the loader
 node, and the LoRA node here were all written for this repo against ComfyUI's own
 quantization backend. Everything is reproducible — `quantize_krea2.py` regenerates any of
-these checkpoints from a BF16 Krea 2 Turbo model in under two minutes.
+these checkpoints from a BF16 Krea 2 model in 40-100 seconds, or about 6 minutes with the
+low-rank refinement pass enabled (the default for `--format svdq`).
 
 This is a **community-produced modification of Krea 2** and is **not an official Krea
 product**. Krea 2 is licensed under the [Krea 2 Community License
@@ -51,7 +60,13 @@ the revenue threshold on commercial use.
    - [`qwen_image_vae.safetensors`](https://huggingface.co/Comfy-Org/Krea-2/resolve/main/vae/qwen_image_vae.safetensors) → `ComfyUI/models/vae/`
 
 4. **Load a workflow.** Drag one of the JSON files from the `workflows/` folder here
-   into ComfyUI, pick your checkpoint in the loader node, and generate.
+   into ComfyUI, pick your checkpoint in the loader node, and generate. (These are saved
+   in ComfyUI's *API* format — they import and run fine, they just arrive without a
+   saved node layout.)
+
+   - `krea2_svdquant_w4a4_t2i.json` → **Turbo**: 8 steps, `cfg 1.0`, zeroed negative.
+   - `krea2_base_svdquant_w4a4_t2i.json` → **base**: 50 steps, `cfg 3.5`, real negative
+     prompt. Treat those as a starting point and tune them.
 
    - `Krea2-Turbo-W4A4-noLowRank.safetensors` → use the normal **UNETLoader** node.
    - Any `SVDQuant-W4A4-rank*` checkpoint → use the **Krea2 SVDQuant W4A4 Loader**
@@ -108,23 +123,33 @@ are not included in this upload; the `quantize_krea2.py` script reproduces them 
 | `quantize_krea2.py` | Converts a BF16 Krea 2 checkpoint to int8, w4a4, or w4a4 + low-rank (svdq) |
 | `svdquant_w4a4.py` | The **Krea2 SVDQuant W4A4 Loader** node — loads `--format svdq` checkpoints (self-contained, no base model needed) |
 | `svdquant_lora.py` | The **Krea2 SVDQuant LoRA Loader** node — the stock ComfyUI LoRA loader silently skips the quantized layers on these models |
-| `workflows/*.json` | Example ComfyUI workflow |
+| `svdquant_diag.py` | The **Krea2 SVDQuant Diagnostics** node — reports which kernel actually runs, plus memory accounting and per-layer timings |
+| `diagnose.py` | The same reports from a terminal, without starting ComfyUI |
+| `workflows/*.json` | Example ComfyUI workflows (turbo and base) |
 
-Installing this adds two nodes: **Krea2 SVDQuant W4A4 Loader** and **Krea2 SVDQuant LoRA
-Loader** — see [Quick start](#quick-start) above.
+Installing this adds three nodes: **Krea2 SVDQuant W4A4 Loader**, **Krea2 SVDQuant LoRA
+Loader**, and **Krea2 SVDQuant Diagnostics** — see [Quick start](#quick-start) above.
 
 ### Quantize your own checkpoint
 
 ```bash
 cd ComfyUI/custom_nodes/krea2-svdquant
-python quantize_krea2.py /path/to/krea2_turbo_bf16.safetensors --format int8
-python quantize_krea2.py /path/to/krea2_turbo_bf16.safetensors --format w4a4
-python quantize_krea2.py /path/to/krea2_turbo_bf16.safetensors --format svdq --rank 64
+python quantize_krea2.py /path/to/krea2_bf16.safetensors --format int8
+python quantize_krea2.py /path/to/krea2_bf16.safetensors --format w4a4
+python quantize_krea2.py /path/to/krea2_bf16.safetensors --format svdq --rank 64
 ```
+
+Add `--variant turbo` or `--variant base` to get a checkpoint name you'll still recognise
+later (`Krea2-Base-SVDQuant-W4A4-rank64.safetensors`) and to record which release it came
+from in the file's metadata. It does not change the quantization: the layer selection keys
+off block naming, which Turbo and base share, so both produce the same 224-layer split.
 
 Only the 224 transformer-block linears (attention + MLP) are quantized; norms,
 modulation, the text-fusion stack, and the final layer stay at full precision — they are
-small and disproportionately sensitive to quantization noise.
+small and disproportionately sensitive to quantization noise. Expect a line like
+`quantized 224 layers; 206 tensors passed through; 896 tensors created ...` for either
+variant — 224 is the whole target set, and a run that reports **0** quantized layers now
+fails loudly with the leaf names it actually found instead of writing a useless file.
 
 An FP8 checkpoint works as a source too — it is reconstructed back to BF16 first. INT8
 and W4A4 sources are rejected, since unpacking those needs layer dimensions the file
@@ -156,7 +181,13 @@ sample data, which is what makes their conversions take hours rather than minute
 ## Benchmarks
 
 All numbers measured on an **RTX 3090 24GB**, 1024x1024, 8-step Euler/simple sampling,
-`cfg=1.0` (Krea 2 Turbo distilled schedule), from the same BF16 source checkpoint.
+`cfg=1.0` (Krea 2 Turbo distilled schedule), from the same BF16 source checkpoint, on a
+**cu130 torch build** (see [Troubleshooting](#troubleshooting) — on an older build every
+one of these numbers gets worse, and the ordering inverts).
+
+These are Turbo numbers. The base model at ~50 steps with CFG does roughly 12x the
+sampling work per image, so the absolute seconds do not transfer; the *ratios* between
+formats do, since they come from the same per-layer kernels.
 
 ### End to end, per image
 
@@ -255,6 +286,81 @@ The included loader instead attaches the LoRA as a parallel low-rank branch, whi
 mathematically identical for a linear layer (`(W + BA)x == Wx + B(Ax)`) and leaves the
 quantized weight untouched. Chain multiple nodes to stack LoRAs. Check the console — it
 reports what it matched, e.g. `224 quantized layers, 32 normal layers`.
+
+The branch is installed as a ComfyUI *object patch*, so it belongs to that one model
+branch: two LoRA loader nodes hanging off the same checkpoint loader no longer contaminate
+each other, and nothing survives past the sampling run. A stack of N LoRAs on one layer is
+folded into a single pair of GEMMs rather than N pairs, and LoRA files are cached by
+mtime, so changing a strength no longer re-reads them from disk.
+
+## Troubleshooting
+
+Start with the **Krea2 SVDQuant Diagnostics** node (drop it between the loader and the
+KSampler, `mode=dispatch`), or from a terminal:
+
+```bash
+python diagnose.py --no-load
+```
+
+### "It's slower than FP8 / slower than BF16"
+
+Almost always this: **ComfyUI disables `comfy_kitchen`'s CUDA backend when torch was built
+against CUDA < 13**, in `comfy/quant_ops.py`:
+
+```python
+if cuda_version < (13,):
+    ck.registry.disable("cuda")
+    logging.warning("WARNING: You need pytorch with cu130 or higher to use optimized CUDA operations.")
+```
+
+`convrot_w4a4_linear` resolves its backend per call, so with `cuda` disabled it falls
+through to the eager implementation — which unpacks int4 to bf16 in Python and runs an
+ordinary matmul. That is strictly slower than just running bf16, and the more aggressive
+the format the worse it gets. The tell is that the ordering **inverts**: fp8 fastest, int8
+middling, w4a4/svdq slowest, the exact opposite of the benchmark table above.
+
+Check with:
+
+```bash
+python -c "import torch; print(torch.__version__, torch.version.cuda)"
+```
+
+If that prints anything below `13.0`, install a cu130+ torch build. The loader now prints
+the resolved backend on every load and shouts if it isn't `cuda`.
+
+### "Pin error." in the console
+
+Harmless. It comes from ComfyUI core (`comfy/model_management.py`), not from this repo,
+and means a weight could not be page-locked so a normal (unpinned) host copy was used
+instead. Results are identical; you lose a little load/offload bandwidth. Windows caps
+locked pages aggressively — `MAX_PINNED_MEMORY` there is 40% of system RAM — so it fires
+routinely with a model this size. It is not specific to `svdq`; INT8 checkpoints trigger it
+too. The diagnostics node prints your pinned-memory budget under `mode=env`.
+
+### Out of memory on a small card (and int8 works fine)
+
+Fixed. The low-rank factors were attached as non-persistent buffers, which ComfyUI's
+`module_size()` — the basis of every VRAM decision, including the lowvram split — could
+not see, while `.to(device)` moved them anyway. Worse, the old branch cached its own
+device move back onto the module, so once ComfyUI offloaded a layer the factors quietly
+came back to the GPU and stayed there, outside all accounting. About 645 MB at rank 64,
+which is the difference between fitting and not on an 8 GB card. INT8 checkpoints carry no
+branch, so they were never affected.
+
+They are now published into `state_dict()` under their own `svdq_l1` / `svdq_l2` keys and
+staged per call via `comfy.model_management.cast_to`, so they are budgeted and offloaded
+like any other weight. `mode=env` on the diagnostics node reports the factor devices — under
+lowvram they should sit on `cpu` between steps, not `cuda`.
+
+One gap remains and it is upstream, not here: `QuantizedTensor.nbytes` reports only the
+packed weight, so the W4A4 `weight_scale` (~3 MB/layer) is still invisible to ComfyUI's
+accounting for *any* w4a4 checkpoint, branch or no branch.
+
+### A re-saved checkpoint logs "left over keys in diffusion model"
+
+Expected. Saving the model out of ComfyUI now includes the `svdq_l1` / `svdq_l2` keys, which
+is what lets the file round-trip back into this loader — but the stock `UNETLoader` doesn't
+know them and says so. Harmless.
 
 ## Accuracy vs. the base model, qualitatively
 

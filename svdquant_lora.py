@@ -15,6 +15,13 @@ parallel branch (mathematically identical for a linear layer: `(W + BA)x == Wx +
 so the quantized weight itself is never touched), and everything else is handed to
 ComfyUI's normal patching path.
 
+The branch is installed through ``ModelPatcher.add_object_patch`` rather than by mutating
+the module. That is what makes the node behave like every other ComfyUI node: `clone()`
+shares the underlying `nn.Module`, so writing the LoRA onto the module directly would
+leak it into every other branch of the graph that came off the same loader, and would
+survive past the sampling run. Object patches are applied in `patch_model` and reverted
+afterwards, per patcher.
+
 Stacking works: chaining multiple of these nodes re-applies the whole LoRA stack from
 scratch each time, so strengths can change without leftover state from a previous value.
 """
@@ -22,6 +29,7 @@ scratch each time, so strengths can change without leftover state from a previou
 from __future__ import annotations
 
 import logging
+import os
 
 import torch
 
@@ -29,9 +37,29 @@ import comfy.lora
 import comfy.utils
 import folder_paths
 
+from .svdquant_w4a4 import add_low_rank, has_branch
+
 _DOWN_SUFFIXES = (".lora_A.weight", ".lora_down.weight", ".lora.down.weight")
 _UP_SUFFIXES = (".lora_B.weight", ".lora_up.weight", ".lora.up.weight")
 _PREFIX = "diffusion_model."
+
+# Reloading a 300 MB LoRA off disk on every graph execution is pure latency when the
+# usual edit is a strength slider. Keyed on mtime+size so editing the file invalidates.
+_LORA_CACHE: dict[str, tuple[tuple, dict]] = {}
+_LORA_CACHE_MAX = 4
+
+
+def _load_lora_cached(path: str) -> dict:
+    stat = os.stat(path)
+    stamp = (stat.st_mtime_ns, stat.st_size)
+    hit = _LORA_CACHE.get(path)
+    if hit is not None and hit[0] == stamp:
+        return hit[1]
+    sd = comfy.utils.load_torch_file(path, safe_load=True)
+    if len(_LORA_CACHE) >= _LORA_CACHE_MAX:
+        _LORA_CACHE.pop(next(iter(_LORA_CACHE)))
+    _LORA_CACHE[path] = (stamp, sd)
+    return sd
 
 
 def _split_lora(lora_sd, quant_layers: set[str]):
@@ -64,30 +92,53 @@ def _split_lora(lora_sd, quant_layers: set[str]):
     return pairs, leftover
 
 
-def apply_svdquant_lora(patcher, lora_sd, strength: float):
-    from .svdquant_w4a4 import attach_branch
+def _make_lora_forward(module, l1: torch.Tensor, l2: torch.Tensor):
+    """A forward that is "quantized weight + svdq branch + this LoRA".
 
-    diffusion_model = patcher.model.diffusion_model
-    quant_layers = {name for name, m in diffusion_model.named_modules()
-                    if hasattr(m, "_branch_specs")}
+    Built on `module._krea2_forward` rather than `module.forward` so that it composes with
+    the svdq branch but never with a previously installed LoRA patch -- each patcher owns
+    the whole LoRA stack and rebuilds it from scratch.
+    """
+    base = module._krea2_forward
 
+    def forward(x, *args, **kwargs):
+        return add_low_rank(base(x, *args, **kwargs), x, l1, l2)
+
+    return forward
+
+
+def _stack_factors(factors: list[tuple[torch.Tensor, torch.Tensor]]):
+    """Collapse a LoRA stack for one layer into a single (l1, l2) pair.
+
+    With the strength already folded into each l2, ``sum_i l1_i @ l2_i`` is exactly
+    ``cat(l1, dim=1) @ cat(l2, dim=0)``, so an N-LoRA stack costs one pair of GEMMs per
+    step instead of N.
+    """
+    if len(factors) == 1:
+        return factors[0]
+    l1 = torch.cat([f[0] for f in factors], dim=1)
+    l2 = torch.cat([f[1] for f in factors], dim=0)
+    return l1.contiguous(), l2.contiguous()
+
+
+def collect_svdquant_lora(patcher, lora_sd, strength: float, quant_layers: set[str],
+                          device, dtype, into: dict):
+    """Accumulate this LoRA's quantized-layer factors into `into`; patch the rest normally.
+
+    Returns the number of layers matched on each path.
+    """
     pairs, leftover = _split_lora(lora_sd, quant_layers)
 
     applied = 0
     for layer, parts in pairs.items():
         if "down" not in parts or "up" not in parts:
             continue
-        module = diffusion_model.get_submodule(layer)
-        device = next((b.device for b in module.buffers()), None)
         rank = int(parts["down"].shape[0])
         alpha = parts.get("alpha")
         mult = strength * (float(alpha) / rank if alpha else 1.0)
-        attach_branch(
-            module,
-            parts["up"].to(device=device, dtype=torch.bfloat16),
-            parts["down"].to(device=device, dtype=torch.bfloat16),
-            scale=mult, kind="lora",
-        )
+        l1 = parts["up"].to(device=device, dtype=dtype)
+        l2 = parts["down"].to(device=device, dtype=dtype) * mult
+        into.setdefault(layer, []).append((l1.contiguous(), l2.contiguous()))
         applied += 1
 
     # Everything the quantized layers did not claim (txtfusion, etc.) goes through
@@ -126,27 +177,43 @@ class Krea2SVDQuantLoraLoader:
             return (model,)
         patcher = model.clone()
 
-        # The W4A4 branches live on the shared model, so re-apply the whole stack from
-        # scratch each time instead of appending blindly. That keeps this node idempotent
-        # when a strength changes, and still stacks correctly when nodes are chained.
+        # Re-apply the whole stack from scratch rather than appending to whatever the
+        # upstream node left behind. That keeps this node idempotent when a strength
+        # changes, and still stacks correctly when nodes are chained.
         stack = list(getattr(model, "krea2_lora_stack", [])) + [(lora_name, strength)]
         patcher.krea2_lora_stack = stack
 
-        from .svdquant_w4a4 import clear_branches
-        for module in patcher.model.diffusion_model.modules():
-            clear_branches(module, "lora")
+        diffusion_model = patcher.model.diffusion_model
+        quant_layers = {name for name, m in diffusion_model.named_modules() if has_branch(m)}
 
+        # Attach on the offload device and let the forward stage them: matching whatever
+        # device the module happens to be on right now would bake in a placement that
+        # ComfyUI is free to change before the first step.
+        device = patcher.offload_device
+        dtype = patcher.model.get_dtype()
+
+        collected: dict[str, list] = {}
         quantized = normal = 0
         for name, amount in stack:
             path = folder_paths.get_full_path_or_raise("loras", name)
-            lora_sd = comfy.utils.load_torch_file(path, safe_load=True)
-            q, n = apply_svdquant_lora(patcher, lora_sd, amount)
+            q, n = collect_svdquant_lora(
+                patcher, _load_lora_cached(path), amount, quant_layers, device, dtype, collected)
             quantized += q
             normal += n
+
         if quantized == 0 and normal == 0:
             raise ValueError(
                 "no layer of {} matched this model; is it a Krea2 LoRA?".format(lora_name)
             )
+
+        for layer, factors in collected.items():
+            module = diffusion_model.get_submodule(layer)
+            l1, l2 = _stack_factors(factors)
+            patcher.add_object_patch(
+                "diffusion_model.{}.forward".format(layer),
+                _make_lora_forward(module, l1, l2),
+            )
+
         logging.info("[krea2-svdquant] LoRA stack %s -> %d quantized layers, %d normal layers",
                      [f"{n}@{a:.2f}" for n, a in stack], quantized, normal)
         return (patcher,)
