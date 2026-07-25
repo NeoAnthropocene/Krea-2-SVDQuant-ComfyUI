@@ -162,6 +162,20 @@ def load_svdquant_w4a4(path: str, model_options: dict | None = None,
 
     logging.info("[krea2-svdquant] w4a4 + low-rank: attached %d branches (rank %d)",
                  attached, int(next(iter(branches.values()))["l1"].shape[1]))
+
+    # The branch buffers are persistent=False (kept out of state_dict so they can't
+    # confuse LoRA/checkpoint key matching), but ComfyUI's model_size() -- which every
+    # VRAM budgeting decision (full-load, lowvram split, pinned buffer size) reads from
+    # -- sums exactly state_dict(). Without this, the whole low-rank branch is invisible
+    # to memory accounting: on a tight-VRAM GPU that's enough to overcommit into an OOM,
+    # or to make wrong offload/reload choices that show up as it running slower than
+    # plain quantized formats that carry no extra branch.
+    branch_bytes = sum(b.numel() * b.element_size()
+                       for m in diffusion_model.modules()
+                       for n, b in m.named_buffers(recurse=False)
+                       if n.startswith("_br_l1_") or n.startswith("_br_l2_"))
+    patcher.size = patcher.model_size() + branch_bytes
+
     return patcher
 
 
