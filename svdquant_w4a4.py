@@ -28,16 +28,7 @@ _L2 = ".svdq_l2"
 
 def attach_branch(module: torch.nn.Module, l1: torch.Tensor, l2: torch.Tensor,
                   scale: float = 1.0, kind: str = "svdq") -> None:
-    """Add ``+ (x @ l2.T) @ l1.T * scale`` to a module's output, in place.
-
-    The module is *not* replaced: swapping it for a wrapper would push its weight down a
-    level in the state dict (``blocks.0.attn.wq.base.weight``), and every LoRA key map in
-    ComfyUI expects ``blocks.0.attn.wq.weight``. Keeping the module identity keeps those
-    paths - and therefore the rest of the ecosystem - intact.
-
-    The branch tensors are non-persistent buffers: they move with ``.to(device)`` but stay
-    out of ``state_dict``, so they cannot confuse key matching either.
-    """
+    """Add ``+ (x @ l2.T) @ l1.T * scale`` to a module's output, in place."""
     if not hasattr(module, "_branch_specs"):
         module._branch_specs = []
         original = module.forward
@@ -45,8 +36,9 @@ def attach_branch(module: torch.nn.Module, l1: torch.Tensor, l2: torch.Tensor,
         def forward(x, *args, **kwargs):
             y = original(x, *args, **kwargs)
             for idx, mult, _ in module._branch_specs:
-                a1 = getattr(module, "_br_l1_{}".format(idx)).to(dtype=x.dtype)
-                a2 = getattr(module, "_br_l2_{}".format(idx)).to(dtype=x.dtype)
+                # DÜZELTME: Cihaz (device) ve veri tipini (dtype) x ile eşitle
+                a1 = getattr(module, "_br_l1_{}".format(idx)).to(device=x.device, dtype=x.dtype)
+                a2 = getattr(module, "_br_l2_{}".format(idx)).to(device=x.device, dtype=x.dtype)
                 y = y + F.linear(F.linear(x, a2), a1) * mult
             return y
 
