@@ -1,9 +1,9 @@
-"""Loader for SVDQuant-on-native-W4A4 checkpoints.
+"""Loader for SVDQuant-on-native-W4A4 checkpoints (built by ``quantize_krea2.py``).
 
-This is SVDQuant's actual mechanism (low-rank bf16 branch + 4-bit residual) running on
-ComfyUI's own ``convrot_w4a4`` kernel instead of a hand-written Triton one. Compared to
-the released W4A16 checkpoint, the activations are 4-bit too, so the matmul finally runs
-on hardware that is faster than bf16 rather than the same bf16 tensor cores.
+This is SVDQuant's mechanism (low-rank bf16 branch + 4-bit residual) running on ComfyUI's
+own ``convrot_w4a4`` kernel. Because the *activations* are 4-bit here too, the matmul runs
+on hardware that is genuinely faster than bf16 -- weight-only 4-bit schemes keep 16-bit
+activations and therefore still run at bf16 tensor-core speed.
 
 The checkpoint is self-contained - it carries the quantized blocks *and* the untouched
 high-precision layers - so no separate base file is needed. Everything except the 224
