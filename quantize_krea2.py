@@ -58,9 +58,53 @@ _QUANT_SUFFIXES = ("attn.wq", "attn.wk", "attn.wv", "attn.gate", "attn.wo",
                    "mlp.gate", "mlp.up", "mlp.down")
 
 
-def is_target(layer: str) -> bool:
+# Checkpoints ship either bare ("blocks.0...") or prefixed ("model.diffusion_model.blocks.0...").
+_PREFIXES = ("model.diffusion_model.", "diffusion_model.", "")
+
+# Anything already quantized: we need the original high-precision weights to work from.
+_QUANTIZED_DTYPES = ("F8_E4M3", "F8_E5M2", "I8", "U8")
+
+
+def detect_prefix(keys) -> str:
+    """Return the prefix the transformer blocks live under, or raise if not found."""
+    for prefix in _PREFIXES:
+        if any(k.startswith("{}blocks.".format(prefix)) for k in keys):
+            return prefix
+    raise SystemExit(
+        "Could not find transformer blocks in this checkpoint. Expected keys like\n"
+        "  blocks.0.attn.wq.weight  or  model.diffusion_model.blocks.0.attn.wq.weight\n"
+        "This does not look like a Krea 2 diffusion model."
+    )
+
+
+def check_source_is_high_precision(handle, keys, prefix: str) -> None:
+    """Refuse to re-quantize an already-quantized checkpoint.
+
+    Quantizing FP8/INT8 weights down to 4 bits stacks one lossy step on another, and the
+    SVD branch would be fitted to already-damaged weights. You need the BF16/FP16 release.
+    """
+    if any(k.endswith(".comfy_quant") for k in keys):
+        raise SystemExit(
+            "This checkpoint is already quantized (it carries `comfy_quant` markers).\n"
+            "Re-quantizing it would stack a second lossy step on top of the first.\n"
+            "Use the original BF16 (or FP16) release of the model as the source instead."
+        )
+    probe = "{}blocks.0.attn.wq.weight".format(prefix)
+    if probe in keys:
+        dtype = handle.get_slice(probe).get_dtype()
+        if dtype in _QUANTIZED_DTYPES:
+            raise SystemExit(
+                "Source weights are {} - this checkpoint is already quantized.\n"
+                "Use the original BF16 (or FP16) release of the model as the source "
+                "instead.".format(dtype)
+            )
+
+
+def is_target(layer: str, prefix: str) -> bool:
     """Only the transformer blocks; txtfusion and friends stay high precision."""
-    return layer.startswith("blocks.") and any(layer.endswith(s) for s in _QUANT_SUFFIXES)
+    if not layer.startswith("{}blocks.".format(prefix)):
+        return False
+    return any(layer.endswith(s) for s in _QUANT_SUFFIXES)
 
 
 def svd_lowrank(weight: torch.Tensor, rank: int, oversample: int = 16, niter: int = 2):
@@ -130,10 +174,12 @@ def convert(src: str, dst: str, fmt: str, groupsize: int, device: str = "cuda", 
 
     with safe_open(src, framework="pt", device="cpu") as handle:
         keys = list(handle.keys())
+        prefix = detect_prefix(keys)
+        check_source_is_high_precision(handle, keys, prefix)
         for i, key in enumerate(keys):
             if key.endswith(".weight"):
                 layer = key[: -len(".weight")]
-                if is_target(layer):
+                if is_target(layer, prefix):
                     w = handle.get_tensor(key).to(device=device, dtype=torch.bfloat16)
                     if rank > 0:
                         w, l1, l2 = svdquant_split(w, rank)
