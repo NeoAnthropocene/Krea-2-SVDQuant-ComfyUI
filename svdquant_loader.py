@@ -1,6 +1,6 @@
 """Load a Krea2 SVDQuant (W4A16 + BF16 low-rank) transformer checkpoint into ComfyUI.
 
-The published checkpoint (``Patil/krea-turbo-svdquant``) is *transformer-linear only*:
+The published checkpoint is *transformer-linear only*:
 it holds 224 quantized ``nn.Linear`` layers (28 blocks x 8 layers) and nothing else -
 no embeddings, norms, modulation, text fusion stack or final layer. Those still have to
 come from a normal Krea2 Turbo checkpoint.

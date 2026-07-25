@@ -49,8 +49,8 @@ option is, for people who want the details.
 
 ## Why this exists
 
-The officially released Krea 2 SVDQuant checkpoint (`transformer_svdquant.safetensors`,
-via `Patil/krea-turbo-svdquant`) is **W4A16**: weights are 4-bit, activations stay
+The officially released Krea 2 SVDQuant checkpoint (`transformer_svdquant.safetensors`) is **W4A16**:
+weights are 4-bit, activations stay
 16-bit. On Ampere that means the matmuls still run on the same bf16 tensor cores as an
 unquantized model — the 4-bit weights only save memory bandwidth, which isn't the
 bottleneck at typical batch/token sizes. Worse, Ampere has no FP8 tensor cores either, so
