@@ -7,22 +7,45 @@ This repo holds the ComfyUI custom nodes and the `quantize_krea2.py` conversion 
 The `.safetensors` checkpoints (7.5-8.3 GB each) are hosted on Hugging Face, not here —
 GitHub isn't a great fit for files that size. Clone this repo into `custom_nodes/`, then
 download whichever checkpoint you want from the Hugging Face repo above into
-`ComfyUI/models/diffusion_models/`.
+`ComfyUI/models/diffusion_models/`. Full steps in [Quick start](#quick-start) below.
 
 License: this project modifies Krea 2 and is distributed under the [Krea 2 Community
 License Agreement](https://www.krea.ai/krea-2-licensing) — see [LICENSE.md](LICENSE.md).
 Not an official Krea product.
 
 Tooling and quantized checkpoints that make **Krea 2 Turbo** run faster and in less VRAM
-on ComfyUI, tuned and measured on an **NVIDIA RTX 3090 (Ampere, sm_86)** — a GPU with no
-FP8 or NVFP4 tensor cores, which is exactly the case most existing Krea 2 quantization
-writeups don't cover.
+on ComfyUI. Works on **any modern NVIDIA GPU** (INT8/W4A4 tensor cores go back to the
+Turing generation, RTX 20-series and up) — benchmarked here on an RTX 3090 (Ampere,
+sm_86), which is the case most existing Krea 2 quantization writeups don't cover, since
+that generation has no FP8 or NVFP4 tensor cores.
 
-This is a **community-produced modification of Krea 2** and is **not an official Krea
-product**. Krea 2 is licensed under the [Krea 2 Community License
-Agreement](https://www.krea.ai/krea-2-licensing); this repository and its checkpoints are
-distributed under the same terms — read them before using these weights, in particular
-the revenue threshold on commercial use.
+## Quick start
+
+1. **Install the custom nodes.** Open a terminal in your ComfyUI folder and run:
+   ```bash
+   git clone https://github.com/alperktt/Krea-2-SVDQuant-ComfyUI custom_nodes/krea2-svdquant
+   ```
+   (No git? Just download this repo as a ZIP and unzip it into `ComfyUI/custom_nodes/`.)
+   Restart ComfyUI.
+
+2. **Download one checkpoint** from the *Files* tab of this page (`Krea2-Turbo-...
+   .safetensors`, pick one — see the table below) and put it in
+   `ComfyUI/models/diffusion_models/`.
+
+3. **Download the text encoder and VAE** (same ones any Krea 2 Turbo workflow needs,
+   not specific to this repo):
+   - [`qwen3vl_4b_fp8_scaled.safetensors`](https://huggingface.co/Comfy-Org/Krea-2/resolve/main/text_encoders/qwen3vl_4b_fp8_scaled.safetensors) → `ComfyUI/models/text_encoders/`
+   - [`qwen_image_vae.safetensors`](https://huggingface.co/Comfy-Org/Krea-2/resolve/main/vae/qwen_image_vae.safetensors) → `ComfyUI/models/vae/`
+
+4. **Load a workflow.** Drag one of the JSON files from the `workflows/` folder here
+   into ComfyUI, pick your checkpoint in the loader node, and generate.
+
+   - `Krea2-Turbo-W4A4-noLowRank.safetensors` → use the normal **UNETLoader** node.
+   - Any `SVDQuant-W4A4-rank*` checkpoint → use the **Krea2 SVDQuant W4A4 Loader**
+     node from this repo instead (it's what shows up after step 1).
+
+That's it. Everything below is background on *why* it's faster and *how accurate* each
+option is, for people who want the details.
 
 ## Why this exists
 
@@ -74,15 +97,8 @@ are not included in this upload; the `quantize_krea2.py` script reproduces them 
 | `extract_base_parts.py` | Strips a full checkpoint down to just the ~0.92 GB the W4A16 loader actually needs |
 | `workflows/*.json` | Example ComfyUI workflows |
 
-### Install
-
-```bash
-git clone <this-repo> ComfyUI/custom_nodes/krea2-svdquant
-```
-
-Restart ComfyUI. This adds four nodes: **Krea2 SVDQuant Loader**, **Krea2 SVDQuant LoRA
-Loader**, **Krea2 SVDQuant W4A4 Loader**, and registers the `quantize_krea2.py` CLI
-script for producing your own checkpoints from a BF16 Krea 2 Turbo model.
+Installing this adds four nodes: **Krea2 SVDQuant Loader**, **Krea2 SVDQuant LoRA
+Loader**, **Krea2 SVDQuant W4A4 Loader** — see [Quick start](#quick-start) above.
 
 ### Quantize your own checkpoint
 
