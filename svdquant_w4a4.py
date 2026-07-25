@@ -25,6 +25,18 @@ import folder_paths
 _L1 = ".svdq_l1"
 _L2 = ".svdq_l2"
 
+# Checkpoints ship either bare ("blocks.0...") or prefixed ("model.diffusion_model.blocks.0...").
+# `comfy.sd.load_diffusion_model_state_dict` strips this prefix internally when it builds the
+# module tree, but we walk that tree ourselves to attach branches, so we have to strip it too.
+_LAYER_PREFIXES = ("model.diffusion_model.", "diffusion_model.", "")
+
+
+def _detect_layer_prefix(keys) -> str:
+    for prefix in _LAYER_PREFIXES:
+        if any(k.startswith("{}blocks.".format(prefix)) for k in keys):
+            return prefix
+    return ""
+
 
 def attach_branch(module: torch.nn.Module, l1: torch.Tensor, l2: torch.Tensor,
                   scale: float = 1.0, kind: str = "svdq") -> None:
@@ -116,6 +128,7 @@ def _shield_from_dynamo(module: torch.nn.Module) -> None:
 def load_svdquant_w4a4(path: str, model_options: dict | None = None,
                        compile_safe: bool = True):
     sd, metadata = comfy.utils.load_torch_file(path, return_metadata=True)
+    layer_prefix = _detect_layer_prefix(sd.keys())
 
     branches: dict[str, dict[str, torch.Tensor]] = {}
     for key in list(sd.keys()):
@@ -140,7 +153,8 @@ def load_svdquant_w4a4(path: str, model_options: dict | None = None,
     for layer, parts in branches.items():
         if "l1" not in parts or "l2" not in parts:
             continue
-        base = _get_submodule(diffusion_model, layer)
+        submodule_path = layer[len(layer_prefix):] if layer_prefix else layer
+        base = _get_submodule(diffusion_model, submodule_path)
         if compile_safe:
             _shield_from_dynamo(base)
         attach_branch(base, parts["l1"], parts["l2"], kind="svdq")

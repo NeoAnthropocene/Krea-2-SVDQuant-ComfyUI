@@ -3,15 +3,19 @@
 ComfyUI already ships native kernels for these formats via comfy_kitchen, so the output
 loads with a plain ``UNETLoader`` -- no custom node, and ordinary LoRA loaders work.
 
-Two targets:
+Three targets:
 
 * ``int8``  -> ``int8_tensorwise`` with per-channel scales + convrot (W8A8).
                Natively accelerated on Ampere INT8 tensor cores.
 * ``w4a4``  -> ``convrot_w4a4`` (W4A4), smaller and potentially faster, 4-bit quality.
+* ``fp8``   -> ``float8_e4m3fn``, a single per-tensor scale, no convrot, no calibration.
+               Lightest touch of the three -- best fidelity, smallest speedup, and the
+               only one of the three that needs no rotation or outlier handling because
+               8-bit float already has enough dynamic range for these weights.
 
-Neither needs a calibration dataset: the convrot (group-wise Hadamard) rotation spreads
-activation/weight outliers analytically, and activations are quantized by the kernel at
-run time.
+None of int8/w4a4/fp8 need a calibration dataset: int8 and w4a4 spread outliers
+analytically via the convrot (group-wise Hadamard) rotation, and activations are
+quantized by the kernel at run time; fp8 just needs one abs-max scale per tensor.
 
 Only the 224 transformer-block linears are quantized, matching the layer set used by the
 reference ``krea2_raw_int8_convrot`` checkpoint. Norms, modulation, the text-fusion stack
@@ -61,8 +65,15 @@ _QUANT_SUFFIXES = ("attn.wq", "attn.wk", "attn.wv", "attn.gate", "attn.wo",
 # Checkpoints ship either bare ("blocks.0...") or prefixed ("model.diffusion_model.blocks.0...").
 _PREFIXES = ("model.diffusion_model.", "diffusion_model.", "")
 
-# Anything already quantized: we need the original high-precision weights to work from.
-_QUANTIZED_DTYPES = ("F8_E4M3", "F8_E5M2", "I8", "U8")
+# Formats we know how to reconstruct back to BF16 from disk alone. FP8 storage is one
+# byte per element with no packing or pre-rotation, so `qdata * scale` recovers the
+# original tensor exactly as it was cast -- no architecture knowledge needed beyond
+# what's already in the file. INT8/W4A4 sources pack multiple values per byte and are
+# rotated (convrot) before quantization; unpacking those correctly needs the exact
+# in/out feature counts from the live nn.Linear, which isn't recoverable from the
+# checkpoint alone, so those are rejected instead.
+_DEQUANTIZABLE_FORMATS = ("float8_e4m3fn", "float8_e5m2")
+_UNSCALED_FP8_DTYPES = ("F8_E4M3", "F8_E5M2")
 
 
 def detect_prefix(keys) -> str:
@@ -77,27 +88,40 @@ def detect_prefix(keys) -> str:
     )
 
 
-def check_source_is_high_precision(handle, keys, prefix: str) -> None:
-    """Refuse to re-quantize an already-quantized checkpoint.
-
-    Quantizing FP8/INT8 weights down to 4 bits stacks one lossy step on another, and the
-    SVD branch would be fitted to already-damaged weights. You need the BF16/FP16 release.
+def check_requantizable(handle, keys, prefix: str) -> None:
+    """Make sure every target layer that's already quantized is something we can
+    dequantize back to BF16 (see `_DEQUANTIZABLE_FORMATS`). Anything else -- most
+    importantly INT8/W4A4 -- needs the original BF16 (or FP16) release instead.
     """
-    if any(k.endswith(".comfy_quant") for k in keys):
-        raise SystemExit(
-            "This checkpoint is already quantized (it carries `comfy_quant` markers).\n"
-            "Re-quantizing it would stack a second lossy step on top of the first.\n"
-            "Use the original BF16 (or FP16) release of the model as the source instead."
-        )
-    probe = "{}blocks.0.attn.wq.weight".format(prefix)
-    if probe in keys:
-        dtype = handle.get_slice(probe).get_dtype()
-        if dtype in _QUANTIZED_DTYPES:
+    for key in keys:
+        if not key.endswith(".comfy_quant"):
+            continue
+        layer = key[: -len(".comfy_quant")]
+        if not is_target(layer, prefix):
+            continue
+        conf = json.loads(bytes(handle.get_tensor(key).tolist()))
+        fmt = conf.get("format")
+        if fmt not in _DEQUANTIZABLE_FORMATS:
             raise SystemExit(
-                "Source weights are {} - this checkpoint is already quantized.\n"
-                "Use the original BF16 (or FP16) release of the model as the source "
-                "instead.".format(dtype)
+                "Layer {} is already quantized as '{}'. Only FP8-quantized layers can be "
+                "automatically reconstructed and re-quantized; for INT8/W4A4 sources, use "
+                "the original BF16 (or FP16) release of the model instead.".format(layer, fmt)
             )
+
+
+def dequantize_target_weight(handle, layer: str, device: str) -> torch.Tensor:
+    """Load a target layer's weight as BF16, dequantizing it first if it's FP8.
+
+    Scaled FP8 (has a `comfy_quant` marker + `weight_scale`): ``qdata.float() * scale``.
+    Unscaled FP8 (a bare ``.to(float8_e4m3fn)`` cast, no marker): ``qdata`` as-is.
+    Anything else is already ruled out by `check_requantizable`.
+    """
+    weight = handle.get_tensor("{}.weight".format(layer)).to(device=device)
+    conf_key = "{}.comfy_quant".format(layer)
+    if conf_key in handle.keys():
+        scale = handle.get_tensor("{}.weight_scale".format(layer)).to(device=device).float()
+        return (weight.to(torch.float32) * scale).to(torch.bfloat16)
+    return weight.to(torch.bfloat16)
 
 
 def is_target(layer: str, prefix: str) -> bool:
@@ -157,6 +181,10 @@ def quantize_weight(weight: torch.Tensor, fmt: str, groupsize: int):
         conf = {"format": "convrot_w4a4", "convrot_groupsize": groupsize,
                 "linear_dtype": getattr(params, "linear_dtype", "int4")}
         scales = {"weight_scale": params.scale}
+    elif fmt == "float8_e4m3fn":
+        qdata, params = layout.quantize(weight, scale="recalculate")
+        conf = {"format": "float8_e4m3fn"}
+        scales = {"weight_scale": params.scale}
     else:
         raise ValueError(fmt)
     return qdata, scales, conf
@@ -175,12 +203,24 @@ def convert(src: str, dst: str, fmt: str, groupsize: int, device: str = "cuda", 
     with safe_open(src, framework="pt", device="cpu") as handle:
         keys = list(handle.keys())
         prefix = detect_prefix(keys)
-        check_source_is_high_precision(handle, keys, prefix)
+        check_requantizable(handle, keys, prefix)
+
+        # Companion keys (old scales/markers) for target layers get regenerated fresh
+        # when we process the ".weight" key below -- skip the stale copies on disk,
+        # otherwise they'd overwrite our new ones later in iteration order.
+        stale_companions = set()
+        for key in keys:
+            if key.endswith(".weight"):
+                layer = key[: -len(".weight")]
+                if is_target(layer, prefix):
+                    for suffix in ("weight_scale", "weight_scale_2", "input_scale", "comfy_quant"):
+                        stale_companions.add("{}.{}".format(layer, suffix))
+
         for i, key in enumerate(keys):
             if key.endswith(".weight"):
                 layer = key[: -len(".weight")]
                 if is_target(layer, prefix):
-                    w = handle.get_tensor(key).to(device=device, dtype=torch.bfloat16)
+                    w = dequantize_target_weight(handle, layer, device)
                     if rank > 0:
                         w, l1, l2 = svdquant_split(w, rank)
                         out["{}.svdq_l1".format(layer)] = l1.cpu()
@@ -198,6 +238,8 @@ def convert(src: str, dst: str, fmt: str, groupsize: int, device: str = "cuda", 
                         print(f"  [{i + 1}/{len(keys)}] quantized {quantized} layers "
                               f"({time.time() - t0:.0f}s)", flush=True)
                     continue
+            if key in stale_companions:
+                continue
             out[key] = handle.get_tensor(key)
             kept += 1
 
@@ -213,15 +255,21 @@ def convert(src: str, dst: str, fmt: str, groupsize: int, device: str = "cuda", 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("src")
-    ap.add_argument("--format", choices=["int8", "w4a4", "svdq"], default="int8",
-                    help="svdq = w4a4 residual + SVDQuant low-rank bf16 branch")
-    ap.add_argument("--groupsize", type=int, default=256)
+    ap.add_argument("--format", choices=["int8", "w4a4", "svdq", "fp8"], default="int8",
+                    help="svdq = w4a4 residual + SVDQuant low-rank bf16 branch; "
+                         "fp8 = float8_e4m3fn, no convrot, no low-rank branch")
+    ap.add_argument("--groupsize", type=int, default=256, help="unused for fp8")
     ap.add_argument("--rank", type=int, default=64, help="low-rank size, svdq only")
     ap.add_argument("--out", default=None)
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
 
-    fmt = "int8_tensorwise" if args.format == "int8" else "convrot_w4a4"
+    fmt = {
+        "int8": "int8_tensorwise",
+        "w4a4": "convrot_w4a4",
+        "svdq": "convrot_w4a4",
+        "fp8": "float8_e4m3fn",
+    }[args.format]
     if fmt not in QUANT_ALGOS:
         raise SystemExit(f"{fmt} is not available in this ComfyUI build")
     rank = args.rank if args.format == "svdq" else 0
@@ -229,7 +277,7 @@ def main():
     out = args.out
     if out is None:
         stem = os.path.splitext(os.path.basename(args.src))[0]
-        suffix = f"svdq_r{rank}" if rank else f"{args.format}_convrot"
+        suffix = f"svdq_r{rank}" if rank else f"{args.format}_convrot" if args.format != "fp8" else "fp8"
         out = os.path.join(os.path.dirname(args.src), f"{stem}_{suffix}.safetensors")
     convert(args.src, out, fmt, args.groupsize, args.device, rank)
 
