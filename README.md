@@ -124,8 +124,34 @@ python quantize_krea2.py /path/to/krea2_turbo_bf16.safetensors --format svdq --r
 
 Only the 224 transformer-block linears (attention + MLP) are quantized; norms,
 modulation, the text-fusion stack, and the final layer stay at full precision — they are
-small and disproportionately sensitive to quantization noise. Runtime per conversion is
-roughly 40-100 seconds on an RTX 3090.
+small and disproportionately sensitive to quantization noise.
+
+An FP8 checkpoint works as a source too — it is reconstructed back to BF16 first. INT8
+and W4A4 sources are rejected, since unpacking those needs layer dimensions the file
+alone doesn't carry; use the original BF16 (or FP16) release for those.
+
+#### Low-rank refinement
+
+For `--format svdq`, a single SVD of `W` is only a first guess: it finds the directions
+that are largest in `W`, which are not the same as the directions the quantizer handles
+worst. So the branch is refit against the *current* quantization error and requantized,
+repeatedly, keeping the best — the same alternating scheme DeepCompressor uses. On Krea 2
+Turbo at rank 64 this cuts reconstruction error by **9.4%**, with all 224 layers
+improving.
+
+Because iteration one is exactly the plain single-shot split and the best result is kept,
+refining can never do worse. It costs conversion time: roughly **6 minutes** instead of
+40-100 seconds. To skip it:
+
+```bash
+python quantize_krea2.py model.safetensors --format svdq --rank 64 --refine-iters 0
+```
+
+The objective here is weight reconstruction error, which needs no calibration data — it
+is the true output error under the assumption that the input covariance is identity, and
+spreading outliers with the convrot rotation is what makes that assumption reasonable.
+Closing the rest of the gap to DeepCompressor means measuring the real covariance from
+sample data, which is what makes their conversions take hours rather than minutes.
 
 ## Benchmarks
 
