@@ -1,22 +1,22 @@
-"""LoRA support for Krea2 SVDQuant models.
+"""LoRA support for Krea2 W4A4 quantized models (from ``quantize_krea2.py``).
 
-A normal `LoraLoaderModelOnly` cannot patch the quantized layers: ComfyUI applies LoRA
-by adding `down @ up` onto a module's `.weight`, and `SVDQuantLinear` has no `.weight` -
-it has packed INT4 buffers plus a low-rank branch. Those 224 patches would silently do
-nothing.
+A normal `LoraLoaderModelOnly` cannot patch these quantized layers correctly: ComfyUI
+applies a LoRA by adding `down @ up` onto a module's `.weight`, but here `.weight` is a
+`QuantizedTensor` -- patching it that way would mean dequantize -> add -> requantize,
+losing the format, or in practice just silently missing the layer.
 
 Krea2 LoRAs (ai-toolkit) target both kinds of layer:
 
-* `diffusion_model.blocks.N.{attn,mlp}.*`  -> quantized, needs an adapter branch
+* `diffusion_model.blocks.N.{attn,mlp}.*`  -> quantized, needs a parallel branch
 * `diffusion_model.txtfusion.*`            -> ordinary Linear, ComfyUI patches it fine
 
-So this node splits the LoRA: quantized layers get an inference-only LoRA branch
-attached to a *replacement module* registered through `add_object_patch` (which
-ComfyUI reverts after the run, so the cached base model is never mutated), and
-everything else is handed to ComfyUI's normal patching path.
+So this node splits the LoRA: quantized layers get the LoRA attached as an extra
+parallel branch (mathematically identical for a linear layer: `(W + BA)x == Wx + B(Ax)`,
+so the quantized weight itself is never touched), and everything else is handed to
+ComfyUI's normal patching path.
 
-Stacking works: each node reads the currently patched module via `get_model_object`,
-carries over its existing branches, and adds its own.
+Stacking works: chaining multiple of these nodes re-applies the whole LoRA stack from
+scratch each time, so strengths can change without leftover state from a previous value.
 """
 
 from __future__ import annotations
@@ -24,60 +24,14 @@ from __future__ import annotations
 import logging
 
 import torch
-import torch.nn.functional as F
 
 import comfy.lora
 import comfy.utils
 import folder_paths
 
-from krea2_svdquant.runtime.linear import SVDQuantLinear
-
-try:
-    from .fast_kernel import FastSVDQuantLinear
-except ImportError:  # running as a plain module
-    from fast_kernel import FastSVDQuantLinear
-
 _DOWN_SUFFIXES = (".lora_A.weight", ".lora_down.weight", ".lora.down.weight")
 _UP_SUFFIXES = (".lora_B.weight", ".lora_up.weight", ".lora.up.weight")
 _PREFIX = "diffusion_model."
-
-
-class LoraBranch(torch.nn.Module):
-    """``x -> (x @ down.T) @ up.T * strength * (alpha / rank)``.
-
-    Kept separate from ``krea2_svdquant``'s own adapter because that one never moves
-    its weights across devices, and ComfyUI moves the model after the patch is applied.
-    """
-
-    def __init__(self, down: torch.Tensor, up: torch.Tensor, strength: float,
-                 alpha: float | None = None):
-        super().__init__()
-        rank = int(down.shape[0])
-        self.register_buffer("down", down.contiguous(), persistent=False)
-        self.register_buffer("up", up.contiguous(), persistent=False)
-        self.multiplier = float(strength) * (float(alpha) / rank if alpha else 1.0)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.down.device != x.device:
-            self.down = self.down.to(x.device)
-            self.up = self.up.to(x.device)
-        down = self.down.to(dtype=x.dtype)
-        up = self.up.to(dtype=x.dtype)
-        return F.linear(F.linear(x, down), up) * self.multiplier
-
-
-class LoraSVDQuantLinear(FastSVDQuantLinear):
-    """SVDQuant linear with extra LoRA branches summed onto the output."""
-
-    def __init__(self, state, backend, branches):
-        super().__init__(state, backend=backend)
-        self.branches = torch.nn.ModuleList(branches)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = super().forward(x)
-        for branch in self.branches:
-            y = y + branch(x)
-        return y
 
 
 def _split_lora(lora_sd, quant_layers: set[str]):
@@ -111,15 +65,11 @@ def _split_lora(lora_sd, quant_layers: set[str]):
 
 
 def apply_svdquant_lora(patcher, lora_sd, strength: float):
-    diffusion_model = patcher.model.diffusion_model
+    from .svdquant_w4a4 import attach_branch
 
-    # Two model flavours: the released W4A16 checkpoint (SVDQuantLinear modules) and the
-    # W4A4 one built by quantize_krea2.py (ComfyUI quantized Linears carrying branches).
-    w4a16 = {name for name, m in diffusion_model.named_modules()
-             if isinstance(m, SVDQuantLinear)}
-    w4a4 = {name for name, m in diffusion_model.named_modules()
-            if hasattr(m, "_branch_specs")}
-    quant_layers = w4a16 | w4a4
+    diffusion_model = patcher.model.diffusion_model
+    quant_layers = {name for name, m in diffusion_model.named_modules()
+                    if hasattr(m, "_branch_specs")}
 
     pairs, leftover = _split_lora(lora_sd, quant_layers)
 
@@ -127,34 +77,16 @@ def apply_svdquant_lora(patcher, lora_sd, strength: float):
     for layer, parts in pairs.items():
         if "down" not in parts or "up" not in parts:
             continue
-        if layer in w4a4:
-            from .svdquant_w4a4 import attach_branch
-            module = diffusion_model.get_submodule(layer)
-            device = next(
-                (b.device for b in module.buffers()), torch.device("cpu"))
-            rank = int(parts["down"].shape[0])
-            alpha = parts.get("alpha")
-            mult = strength * (float(alpha) / rank if alpha else 1.0)
-            attach_branch(
-                module,
-                parts["up"].to(device=device, dtype=torch.bfloat16),
-                parts["down"].to(device=device, dtype=torch.bfloat16),
-                scale=mult, kind="lora",
-            )
-            applied += 1
-            continue
-
-        key = _PREFIX + layer
-        current = patcher.get_model_object(key)
-        branches = list(getattr(current, "branches", []))
-        device = current.qweight.device
-        branches.append(LoraBranch(
-            parts["down"].to(device=device, dtype=torch.bfloat16),
+        module = diffusion_model.get_submodule(layer)
+        device = next((b.device for b in module.buffers()), None)
+        rank = int(parts["down"].shape[0])
+        alpha = parts.get("alpha")
+        mult = strength * (float(alpha) / rank if alpha else 1.0)
+        attach_branch(
+            module,
             parts["up"].to(device=device, dtype=torch.bfloat16),
-            strength, parts.get("alpha"),
-        ))
-        patcher.add_object_patch(
-            key, LoraSVDQuantLinear(current.state, current.backend, branches)
+            parts["down"].to(device=device, dtype=torch.bfloat16),
+            scale=mult, kind="lora",
         )
         applied += 1
 
@@ -176,7 +108,7 @@ class Krea2SVDQuantLoraLoader:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "model": ("MODEL", {"tooltip": "Output of the Krea2 SVDQuant Loader."}),
+                "model": ("MODEL", {"tooltip": "Output of the Krea2 SVDQuant W4A4 Loader."}),
                 "lora_name": (folder_paths.get_filename_list("loras"),),
                 "strength": ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.01}),
             }
@@ -186,8 +118,8 @@ class Krea2SVDQuantLoraLoader:
     FUNCTION = "load_lora"
     CATEGORY = "advanced/loaders"
     TITLE = "Krea2 SVDQuant LoRA Loader"
-    DESCRIPTION = ("Applies a LoRA to a Krea2 SVDQuant model. The standard LoRA loader "
-                   "cannot patch the quantized layers because they have no .weight tensor.")
+    DESCRIPTION = ("Applies a LoRA to a Krea2 W4A4 quantized model. The standard LoRA "
+                   "loader silently skips the quantized layers on these models.")
 
     def load_lora(self, model, lora_name, strength):
         if strength == 0:

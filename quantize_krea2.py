@@ -63,14 +63,35 @@ def is_target(layer: str) -> bool:
     return layer.startswith("blocks.") and any(layer.endswith(s) for s in _QUANT_SUFFIXES)
 
 
+def svd_lowrank(weight: torch.Tensor, rank: int, oversample: int = 16, niter: int = 2):
+    """Randomized truncated SVD: return (L1 [out, rank], L2 [rank, in]) with W ~ L1 @ L2.
+
+    Randomized rather than exact because these are 6144x16384 matrices and only the top
+    few dozen singular directions matter here; `oversample` extra probe columns plus a
+    couple of power iterations recover them to well past the precision 4-bit quantization
+    cares about.
+    """
+    w = weight.float()
+    min_dim = min(w.shape)
+    rank = max(1, min(int(rank), min_dim))
+    q = min(rank + max(0, int(oversample)), min_dim)
+
+    if min_dim <= max(q, 32):
+        u, s, vh = torch.linalg.svd(w, full_matrices=False)
+        u_r, s_r, vh_r = u[:, :rank], s[:rank], vh[:rank, :]
+    else:
+        u, s, v = torch.svd_lowrank(w, q=q, niter=max(0, int(niter)))
+        u_r, s_r, vh_r = u[:, :rank], s[:rank], v[:, :rank].transpose(-2, -1)
+
+    return (u_r * s_r.unsqueeze(0)).contiguous(), vh_r.contiguous()
+
+
 def svdquant_split(weight: torch.Tensor, rank: int):
     """SVDQuant ordering: pull a low-rank bf16 branch out of W, quantize the residual.
 
     The low-rank branch absorbs the outlier-heavy directions, so the part that has to
     survive 4 bits is better conditioned.
     """
-    from krea2_svdquant.quant.svd import svd_lowrank
-
     l1, l2 = svd_lowrank(weight.float(), rank, oversample=16, niter=2)
     l1 = l1.to(torch.bfloat16)
     l2 = l2.to(torch.bfloat16)

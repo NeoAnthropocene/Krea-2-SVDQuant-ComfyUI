@@ -4,20 +4,33 @@
 [huggingface.co/AlperKTS/Krea-2-SVDQuant-ComfyUI](https://huggingface.co/AlperKTS/Krea-2-SVDQuant-ComfyUI)
 
 This repo holds the ComfyUI custom nodes and the `quantize_krea2.py` conversion script.
-The `.safetensors` checkpoints (7.5-8.3 GB each) are hosted on Hugging Face, not here —
-GitHub isn't a great fit for files that size. Clone this repo into `custom_nodes/`, then
-download whichever checkpoint you want from the Hugging Face repo above into
-`ComfyUI/models/diffusion_models/`. Full steps in [Quick start](#quick-start) below.
+The `.safetensors` checkpoints (7.5-8.3 GB each) are hosted on Hugging Face, not here.
+Clone this repo into `custom_nodes/`, then download whichever checkpoint you want from
+the Hugging Face repo above into `ComfyUI/models/diffusion_models/`.
 
 License: this project modifies Krea 2 and is distributed under the [Krea 2 Community
-License Agreement](https://www.krea.ai/krea-2-licensing) — see [LICENSE.md](LICENSE.md).
+License Agreement](https://www.krea.ai/krea-2-licensing) - see [LICENSE.md](LICENSE.md).
 Not an official Krea product.
 
-Tooling and quantized checkpoints that make **Krea 2 Turbo** run faster and in less VRAM
-on ComfyUI. Works on **any modern NVIDIA GPU** (INT8/W4A4 tensor cores go back to the
-Turing generation, RTX 20-series and up) — benchmarked here on an RTX 3090 (Ampere,
-sm_86), which is the case most existing Krea 2 quantization writeups don't cover, since
-that generation has no FP8 or NVFP4 tensor cores.
+Quantized **Krea 2 Turbo** checkpoints for ComfyUI — about **2x faster** and **a third the
+size** of the usual FP8 version, with no calibration dataset needed. Download a
+checkpoint, install the custom nodes, load the included workflow, done.
+
+Works on **any modern NVIDIA GPU** — INT8/W4A4 tensor cores go back to Turing (RTX
+20-series and up). Benchmarked on an RTX 3090 (Ampere, sm_86), which is the case most
+existing Krea 2 quantization writeups don't cover, since that generation has no FP8 or
+NVFP4 tensor cores at all.
+
+This is an experimental, built-from-scratch project: the quantization script, the loader
+node, and the LoRA node here were all written for this repo against ComfyUI's own
+quantization backend. Everything is reproducible — `quantize_krea2.py` regenerates any of
+these checkpoints from a BF16 Krea 2 Turbo model in under two minutes.
+
+This is a **community-produced modification of Krea 2** and is **not an official Krea
+product**. Krea 2 is licensed under the [Krea 2 Community License
+Agreement](https://www.krea.ai/krea-2-licensing); this repository and its checkpoints are
+distributed under the same terms — read them before using these weights, in particular
+the revenue threshold on commercial use.
 
 ## Quick start
 
@@ -49,22 +62,25 @@ option is, for people who want the details.
 
 ## Why this exists
 
-The officially released Krea 2 SVDQuant checkpoint (`transformer_svdquant.safetensors`) is **W4A16**:
-weights are 4-bit, activations stay
-16-bit. On Ampere that means the matmuls still run on the same bf16 tensor cores as an
-unquantized model — the 4-bit weights only save memory bandwidth, which isn't the
-bottleneck at typical batch/token sizes. Worse, Ampere has no FP8 tensor cores either, so
-the common "just use FP8" advice also just gets cast to bf16 and run through cuBLAS.
+The usual advice for making Krea 2 cheaper to run is FP8. That only pays off if your GPU
+has FP8 tensor cores — Ada, Hopper, Blackwell. On anything older, FP8 weights get cast
+back to bf16 before the matmul and run through cuBLAS, so you save VRAM but gain no
+speed. Measured on an RTX 3090, FP8 was *slower* than plain bf16.
 
-The actual bottleneck-breaking hardware Ampere *does* have is **native INT8 tensor
-cores**. This repo quantizes Krea 2 Turbo directly to formats ComfyUI already has native
-kernels for (`int8_tensorwise` and `convrot_w4a4`, both in `comfy_kitchen`), and adds
-back an SVDQuant-style low-rank branch on top of the native W4A4 kernel for the cases
-where you want quantized *activations* without giving up the SVDQuant accuracy trick.
+The same trap catches weight-only 4-bit quantization (W4A16): if activations stay 16-bit,
+the matmul still runs on bf16 tensor cores at bf16 speed. 4-bit weights only reduce
+memory bandwidth, which isn't the bottleneck at typical resolutions and batch sizes.
 
-No calibration dataset is needed for any of this — the `convrot` (group-wise Hadamard
-rotation) step spreads outliers analytically, and activations are quantized by the
-kernel at run time.
+What actually moves the needle is quantizing **activations too**, onto hardware that has
+the units for it. **INT8 and W4A4 tensor cores go back to Turing (RTX 20-series)** — far
+wider support than FP8. So this repo quantizes Krea 2 Turbo from BF16 straight into
+formats ComfyUI already ships native kernels for (`int8_tensorwise` and `convrot_w4a4`
+in `comfy_kitchen`), and adds an SVDQuant-style low-rank correction branch on top of the
+native W4A4 kernel to claw back accuracy at 4 bits.
+
+No calibration dataset is needed — the `convrot` (group-wise Hadamard rotation) step
+spreads outliers analytically, and activations are quantized by the kernel at run time.
+Everything here was built from scratch against ComfyUI's own quantization backend.
 
 ## Included checkpoints
 
@@ -89,16 +105,13 @@ are not included in this upload; the `quantize_krea2.py` script reproduces them 
 
 | file | what it is |
 |---|---|
-| `quantize_krea2.py` | Converts a BF16 Krea 2 checkpoint to int8, w4a4, or w4a4+low-rank (svdq) |
-| `svdquant_loader.py` | Loads the *officially released* W4A16 SVDQuant checkpoint (merges it with a base model, since that checkpoint ships transformer-linears only) |
-| `svdquant_lora.py` | LoRA loader that works on both the W4A16 and W4A4 quantized models — the stock ComfyUI LoRA loader silently patches only ~12% of layers on these models |
-| `svdquant_w4a4.py` | Loads checkpoints produced by `quantize_krea2.py --format svdq` (self-contained, no base model needed) |
-| `fast_kernel.py` | A bf16 tensor-core Triton W4A16 kernel, ~3.5x faster than the kernel shipped with the official checkpoint on Ampere |
-| `extract_base_parts.py` | Strips a full checkpoint down to just the ~0.92 GB the W4A16 loader actually needs |
-| `workflows/*.json` | Example ComfyUI workflows |
+| `quantize_krea2.py` | Converts a BF16 Krea 2 checkpoint to int8, w4a4, or w4a4 + low-rank (svdq) |
+| `svdquant_w4a4.py` | The **Krea2 SVDQuant W4A4 Loader** node — loads `--format svdq` checkpoints (self-contained, no base model needed) |
+| `svdquant_lora.py` | The **Krea2 SVDQuant LoRA Loader** node — the stock ComfyUI LoRA loader silently skips the quantized layers on these models |
+| `workflows/*.json` | Example ComfyUI workflow |
 
-Installing this adds four nodes: **Krea2 SVDQuant Loader**, **Krea2 SVDQuant LoRA
-Loader**, **Krea2 SVDQuant W4A4 Loader** — see [Quick start](#quick-start) above.
+Installing this adds two nodes: **Krea2 SVDQuant W4A4 Loader** and **Krea2 SVDQuant LoRA
+Loader** — see [Quick start](#quick-start) above.
 
 ### Quantize your own checkpoint
 
@@ -183,8 +196,9 @@ quality matters more than raw speed; `svdq` is the faster, smaller choice.**
 | 128 | 8.30 GB |
 | 256 | 9.10 GB |
 
-Full accuracy/speed benchmarking across the sweep is in progress — the r64 numbers above
-are the fully measured baseline. If you test other ranks, results and PRs are welcome.
+This is an experimental project — the rank sweep is deliberately shipped so people can
+try the tradeoff themselves rather than take one number on faith. If you benchmark other
+ranks or find a case where one clearly wins, open a discussion on this repo.
 
 ### Where the remaining time goes (profiled, `svdq r64`, single denoise step, 175.7 ms)
 
@@ -205,14 +219,16 @@ graph breaks so inductor still fuses everything around them. First run after loa
 
 ## LoRA
 
-Both loader nodes are paired with **Krea2 SVDQuant LoRA Loader** — do not use the stock
-`LoraLoaderModelOnly` on these models. It patches `weight += down @ up`, but the
-quantized layers either have no plain `.weight` (W4A16) or a `QuantizedTensor` that can't
-be patched that way without breaking the quantization (W4A4). The stock loader ends up
-silently matching only the ~32 non-quantized layers (text-fusion) out of ~256 and misses
-all 224 transformer-block layers with no error. The included loader instead attaches the
-LoRA as a parallel low-rank branch, which is mathematically identical for a linear layer
-(`(W + BA)x == Wx + B(Ax)`) and keeps the quantized weight untouched.
+Use **Krea2 SVDQuant LoRA Loader**, not the stock `LoraLoaderModelOnly`. The stock loader
+patches `weight += down @ up`, but on these models `.weight` is a `QuantizedTensor` —
+patching it that way would mean dequantize → add → requantize, losing the format. In
+practice it silently matches only the ~32 non-quantized layers (text-fusion) out of ~256
+and misses all 224 transformer-block layers, with no error.
+
+The included loader instead attaches the LoRA as a parallel low-rank branch, which is
+mathematically identical for a linear layer (`(W + BA)x == Wx + B(Ax)`) and leaves the
+quantized weight untouched. Chain multiple nodes to stack LoRAs. Check the console — it
+reports what it matched, e.g. `224 quantized layers, 32 normal layers`.
 
 ## Accuracy vs. the base model, qualitatively
 
@@ -303,6 +319,7 @@ community contribution, not an official Krea product, and is not endorsed by Kre
 The quantization kernels used here (`int8_tensorwise`, `convrot_w4a4`) are native to
 [ComfyUI](https://github.com/comfyanonymous/ComfyUI)'s `comfy_kitchen` backend. The
 low-rank branch construction follows the method described in the [SVDQuant
-paper](https://arxiv.org/abs/2411.05007) (Li et al., MIT Han Lab), reimplemented here on
-top of ComfyUI's native kernel rather than the paper's own Nunchaku engine, which has no
+paper](https://arxiv.org/abs/2411.05007) (Li et al., MIT Han Lab), implemented here from
+scratch on top of ComfyUI's native kernel rather than the paper's own Nunchaku engine,
+which has no
 Krea 2 architecture support.
