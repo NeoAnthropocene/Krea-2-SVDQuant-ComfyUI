@@ -249,6 +249,26 @@ def leaf_ranks(rank: int, rank_alloc: str = "uniform") -> dict[str, int]:
     return out
 
 
+def rank_for_leaf(ranks: dict[str, int], leaf: str | None) -> int:
+    """The branch rank for a target layer, given its leaf name. 0 means "no branch".
+
+    Matches by suffix because `is_target` does. An exact-key lookup would disagree with it
+    on any variant that nested the leaves one level deeper (`blocks.0.wrapper.attn.wq`):
+    such a layer is a quantization target, so it would be quantized, but would find no rank
+    entry and be written without a low-rank branch -- an svdq checkpoint silently missing
+    branches on part of the network, which is the class of quiet wrongness the zero-layer
+    check below exists to prevent.
+    """
+    if not ranks or leaf is None:
+        return 0
+    if leaf in ranks:
+        return ranks[leaf]
+    for suffix, value in ranks.items():
+        if leaf.endswith(suffix):
+            return value
+    return 0
+
+
 def svd_lowrank(weight: torch.Tensor, rank: int, oversample: int = 16, niter: int = 2):
     """Randomized truncated SVD: return (L1 [out, rank], L2 [rank, in]) with W ~ L1 @ L2.
 
@@ -416,8 +436,9 @@ def convert(src: str, dst: str, fmt: str, groupsize: int, device: str = "cuda", 
                     # A reallocated budget can ask for more rank than the weight has singular
                     # directions (attn.wk is only 1536 wide). `svd_lowrank` clamps internally,
                     # but clamping here too keeps the reported rank honest.
-                    leaf_rank = min(ranks.get(leaf, 0), min(w.shape))
-                    if leaf and leaf_rank < ranks.get(leaf, 0):
+                    wanted = rank_for_leaf(ranks, leaf)
+                    leaf_rank = min(wanted, min(w.shape))
+                    if leaf and leaf_rank < wanted:
                         clamped[leaf] = leaf_rank
                     if leaf_rank > 0:
                         split = svdquant_split(w, leaf_rank, fmt, groupsize, refine_iters)

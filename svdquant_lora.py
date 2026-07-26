@@ -132,8 +132,12 @@ def _stack_factors(factors: list[tuple[torch.Tensor, torch.Tensor]]):
 
 
 def collect_svdquant_lora(patcher, lora_sd, strength: float, quant_layers: set[str],
-                          device, dtype, into: dict):
+                          device, dtype, into: dict, patch_leftover: bool = True):
     """Accumulate this LoRA's quantized-layer factors into `into`; patch the rest normally.
+
+    `patch_leftover=False` collects the quantized side only and leaves the non-quantized
+    layers alone -- see `load_lora` for why the two sides of the stack are handled
+    differently.
 
     Returns the number of layers matched on each path.
     """
@@ -152,6 +156,9 @@ def collect_svdquant_lora(patcher, lora_sd, strength: float, quant_layers: set[s
         l2 = parts["down"].to(device=device, dtype=dtype) * mult
         into.setdefault(layer, []).append((l1.contiguous(), l2.contiguous()))
         applied += 1
+
+    if not patch_leftover:
+        return applied, 0
 
     # Everything the quantized layers did not claim (txtfusion, etc.) goes through
     # ComfyUI's normal LoRA path.
@@ -225,15 +232,33 @@ class Krea2SVDQuantLoraLoader:
         device = patcher.offload_device
         dtype = patcher.model.get_dtype()
 
+        # The two sides of the stack have to be replayed differently, because the two
+        # mechanisms behind them compose differently:
+        #
+        # * `add_object_patch` is keyed, so writing the whole stack's folded factors for a
+        #   layer *replaces* whatever an upstream node put there. Replaying every entry is
+        #   what makes a strength change exact rather than cumulative.
+        # * `add_patches` *appends*, and `clone()` copies the parent's `patches`. So
+        #   replaying an earlier entry's non-quantized layers adds a second copy on top of
+        #   the one just inherited: chaining two nodes used to apply the first LoRA's
+        #   txtfusion layers twice (measured: 3 patch entries per key instead of 2) while
+        #   its quantized layers stayed correct -- the two halves of one LoRA silently
+        #   running at different strengths.
+        #
+        # So only the newest entry patches normally; earlier ones are already inherited.
         collected: dict[str, list] = {}
         quantized = normal = 0
-        for name, amount in stack:
+        newest = len(stack) - 1
+        for i, (name, amount) in enumerate(stack):
             path = folder_paths.get_full_path_or_raise("loras", name)
             q, n = collect_svdquant_lora(
-                patcher, _load_lora_cached(path), amount, quant_layers, device, dtype, collected)
-            quantized += q
-            normal += n
+                patcher, _load_lora_cached(path), amount, quant_layers, device, dtype,
+                collected, patch_leftover=(i == newest))
+            if i == newest:
+                quantized, normal = q, n
 
+        # Both guards are about the LoRA this node just added, not the stack total: an
+        # upstream LoRA matching plenty of layers must not excuse this one matching none.
         if quantized == 0 and normal == 0:
             raise ValueError(
                 "no layer of {} matched this model ({} quantized layers were available); "
@@ -256,8 +281,10 @@ class Krea2SVDQuantLoraLoader:
                 _make_lora_forward(module, l1, l2),
             )
 
-        logging.info("[krea2-svdquant] LoRA stack %s -> %d quantized layers, %d normal layers"
-                     "%s", [f"{n}@{a:.2f}" for n, a in stack], quantized, normal,
+        logging.info("[krea2-svdquant] LoRA stack %s -> %d quantized layers branched; "
+                     "%s added %d quantized, %d normal layers%s",
+                     [f"{n}@{a:.2f}" for n, a in stack], len(collected), lora_name,
+                     quantized, normal,
                      " (no-low-rank checkpoint: {} quantized layers carry no svdq branch)"
                      .format(unbranched) if unbranched else "")
         return (patcher,)
