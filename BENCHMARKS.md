@@ -37,6 +37,17 @@ per prompt, all 12 checkpoints side by side with the gemini quality score under 
 | 09_counting_objects | "A wooden table from directly above with exactly seven red apples arranged in a neat row next to three green pears, soft natural light, flat lay photography" | object counting |
 | 10_complex_scene | "A fantasy marketplace street at golden hour, merchant stalls with hanging fabrics and baskets of spices, a dragon perched on a rooftop in the background, dense crowd, painterly digital art" | complex composition |
 
+![01_dense_text](examples/rank_sweep_t2i_comparison/grid_01_dense_text.png)
+![02_curved_text](examples/rank_sweep_t2i_comparison/grid_02_curved_text.png)
+![03_hands_detail](examples/rank_sweep_t2i_comparison/grid_03_hands_detail.png)
+![04_crowd_faces](examples/rank_sweep_t2i_comparison/grid_04_crowd_faces.png)
+![05_symmetry_pattern](examples/rank_sweep_t2i_comparison/grid_05_symmetry_pattern.png)
+![06_multi_subject](examples/rank_sweep_t2i_comparison/grid_06_multi_subject.png)
+![07_reflections_glass](examples/rank_sweep_t2i_comparison/grid_07_reflections_glass.png)
+![08_logo_typography](examples/rank_sweep_t2i_comparison/grid_08_logo_typography.png)
+![09_counting_objects](examples/rank_sweep_t2i_comparison/grid_09_counting_objects.png)
+![10_complex_scene](examples/rank_sweep_t2i_comparison/grid_10_complex_scene.png)
+
 ## Test 2 — krea2edit LoRA (identity-preserving editing)
 
 Same rank sweep, this time with the [Krea 2 Identity Edit LoRA](https://github.com/lbouaraba/comfyui-krea2edit)
@@ -48,11 +59,11 @@ layers on these models (see the main README's [LoRA](README.md#lora) section).
 
 Three real stock photos of different women, resized to 1024x1536 before editing (feeding
 multi-thousand-pixel originals straight into VAEEncode wastes VRAM/time for no quality
-gain at this model's ~1MP working resolution). Source photos:
-[`examples/krea2edit_lora_comparison/source_photos/`](examples/krea2edit_lora_comparison/source_photos/).
+gain at this model's ~1MP working resolution).
 
-[`examples/krea2edit_lora_comparison/`](examples/krea2edit_lora_comparison/) — one grid PNG
-per edit instruction, all 12 checkpoints side by side.
+| woman 1 | woman 2 | woman 3 |
+|---|---|---|
+| ![woman1](examples/krea2edit_lora_comparison/source_photos/source_woman1.png) | ![woman2](examples/krea2edit_lora_comparison/source_photos/source_woman2.png) | ![woman3](examples/krea2edit_lora_comparison/source_photos/source_woman3.png) |
 
 | id | source | instruction |
 |---|---|---|
@@ -62,6 +73,13 @@ per edit instruction, all 12 checkpoints side by side.
 | e4_night_lights_off_w2 | woman 2 | "Change the scene to nighttime, turn off any lights, dark moody night sky, keep her exact face unchanged." |
 | e5_paris_w3 | woman 3 | "Place her in Paris with the Eiffel Tower visible behind her, keep her exact face, hairstyle, and outfit unchanged." |
 | e6_night_lights_off_w3 | woman 3 | "Change the lighting to nighttime with all lights turned off, dark and moody atmosphere, keep her exact face unchanged." |
+
+![e1_paris_w1](examples/krea2edit_lora_comparison/grid_e1_paris_w1.png)
+![e2_sunset_sky_w1](examples/krea2edit_lora_comparison/grid_e2_sunset_sky_w1.png)
+![e3_horse_w2](examples/krea2edit_lora_comparison/grid_e3_horse_w2.png)
+![e4_night_lights_off_w2](examples/krea2edit_lora_comparison/grid_e4_night_lights_off_w2.png)
+![e5_paris_w3](examples/krea2edit_lora_comparison/grid_e5_paris_w3.png)
+![e6_night_lights_off_w3](examples/krea2edit_lora_comparison/grid_e6_night_lights_off_w3.png)
 
 ## Results
 
