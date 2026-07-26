@@ -112,11 +112,28 @@ The no-low-rank file loads with the stock ComfyUI **UNETLoader**. The three `svd
 checkpoints need the **Krea2 SVDQuant W4A4 Loader** node from this repo (they carry extra
 `*.svdq_l1` / `*.svdq_l2` tensors the stock loader doesn't know about).
 
-Higher rank = larger low-rank correction branch = closer to the unquantized model on
-paper, but it is **not strictly monotonic in practice** — see the accuracy section below.
-Rank 32 and 256 were also produced and benchmarked for accuracy during development but
-are not included in this upload; the `quantize_krea2.py` script reproduces them exactly
-(`--rank 32` / `--rank 256`) if you want them.
+Higher rank = larger low-rank correction branch = closer to the unquantized model. All three
+are built with `refine_iters=100`, which is what makes that true — see
+[the rank/refine section](#rank-and-refine_iters-are-one-lever-not-two). Branch
+reconstruction error over four sampled layers: 0.127 at rank 16, 0.098 at rank 64, 0.080 at
+rank 128.
+
+Each file records how it was built in its safetensors metadata (`krea2_svdquant_rank`,
+`krea2_svdquant_refine_iters`, tool version, source file), so you can check what you
+downloaded rather than trusting this table:
+
+```python
+from safetensors import safe_open
+with safe_open("Krea2-Turbo-SVDQuant-W4A4-rank64.safetensors", framework="pt") as f:
+    print(f.metadata())
+```
+
+> Builds published before 2026-07-26 carry no metadata and were made **without** refinement.
+> If `f.metadata()` returns `None`, re-download — at rank 128 the unrefined build measures
+> 0.095 against the refined 0.080, and the whole rank ladder is flat without refinement.
+
+Rank 32 and 256 were also produced and benchmarked during development but are not included
+in this upload; `quantize_krea2.py` reproduces them exactly (`--rank 32` / `--rank 256`).
 
 ## What's in this repo
 
