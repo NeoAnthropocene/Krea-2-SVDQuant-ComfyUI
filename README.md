@@ -174,10 +174,38 @@ queue. Three things to know before you do:
   reload.
 - **It writes ~8 GB**, and refuses rather than overwriting unless you tick `overwrite`.
 
-The node defaults `refine_iters` to **0**. The refinement loop provably lowers weight
-reconstruction error, but it has not been shown to improve the images — see
-[accuracy](#accuracy-vs-the-base-model-qualitatively) — so paying 6x the conversion time for
-it is opt-in, not the default.
+**`rank` and `refine_iters` are one lever, not two.** Measured with LPIPS against a BF16
+reference over 10 prompts: with refinement on, LPIPS falls monotonically with rank across all
+five ranks tested (16 → 256), and higher rank helps in **10 of 10** prompts individually. With
+refinement off, the same sweep is flat — rank 16 and rank 256 land within noise of each other
+(0.337 vs 0.340), so the extra 1.5 GB buys nothing. Each doubling of rank buys about 0.013
+LPIPS when refining, against a reseed distance of 0.531.
+
+So: raising rank without `refine_iters > 0` is wasted file size. If you want the cheap build,
+lower the rank rather than skipping refinement. Full numbers in
+[accuracy](#accuracy-vs-the-base-model-qualitatively).
+
+### `--rank-alloc`: where the rank goes, and why it doesn't matter
+
+Rank is uniform across all 224 layers by default, and that is measurably not the efficient
+choice. At rank 64, error removed per million branch parameters spans **6.9x** across the eight
+projection types — `attn.wk` returns 0.0992 against `mlp.up`'s 0.0143. The cause is GQA: Krea 2
+has 12 kv heads against 48 query heads, so `wk`/`wv` are 1536-wide and their branch costs a
+third of an MLP branch while absorbing twice as much error.
+
+`--rank-alloc gqa` spends the same bytes accordingly (`wk` 360, `wv` 256, `wq` 72, `wo` 64,
+`gate` 56, MLP 8 — 0.02% smaller than uniform rank 64, same speed at 7.1 s/image).
+
+**It does not improve the images.** LPIPS 0.3523 against uniform's 0.3403, better on 5 of 10
+prompts, paired t = +0.55 on 9 df — no effect in either direction. The greedy solve predicted
+6% less weight error and that did not translate. It does halve the spread across prompts
+(variance ratio 4.64, F-test p = 0.032) and improve the worst prompt, 0.4975 → 0.4470, which is
+worth someone re-testing at more than 10 images but is not a reason to change the default.
+
+Kept because the mechanism is sound and the option is cheap to leave in. The transferable
+result is negative: weight reconstruction error is a poor predictor of image outcome on this
+model — three separate attempts to optimise against it (the refinement objective, per-block
+depth allocation, this) have failed to move LPIPS in the predicted direction.
 
 Add `--variant turbo` or `--variant base` to get a checkpoint name you'll still recognise
 later (`Krea2-Base-SVDQuant-W4A4-rank64.safetensors`) and to record which release it came

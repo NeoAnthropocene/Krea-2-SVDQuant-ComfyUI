@@ -58,17 +58,31 @@ class Krea2SVDQuantQuantize:
                                "option and still ~2x fp8 on Ampere. fp8: storage only.",
                 }),
                 "rank": ("INT", {
-                    "default": 64, "min": 8, "max": 512, "step": 8,
-                    "tooltip": "svdq only: size of the low-rank branch. Higher is not "
-                               "reliably better - see the accuracy section of the README.",
+                    "default": 64, "min": 8, "max": 1024, "step": 8,
+                    "tooltip": "svdq only: size of the low-rank branch. Only pays off with "
+                               "refine_iters > 0 - measured LPIPS falls monotonically with "
+                               "rank when refining and is flat without it. Each doubling buys "
+                               "about 0.013 LPIPS.",
+                }),
+                "rank_alloc": (["uniform", "gqa"], {
+                    "default": "uniform",
+                    "tooltip": "svdq only: how the rank budget is spread across the eight "
+                               "projection types. Same file size either way. uniform gives "
+                               "every layer the same rank. gqa moves the budget to attn.wk / "
+                               "attn.wv, which absorb ~2x the quantization error at a third of "
+                               "the branch cost because Krea 2 has only 12 kv heads. Measured "
+                               "and it does not pay: LPIPS 0.3523 vs 0.3403 for uniform, 5 of "
+                               "10 prompts better, no mean effect. It does halve the spread "
+                               "across prompts and improve the worst one. Leave on uniform "
+                               "unless you are re-testing that.",
                 }),
                 "refine_iters": ("INT", {
-                    "default": 0, "min": 0, "max": 200,
-                    "tooltip": "svdq only. 0 is a single-shot SVD split (~54s). Higher "
-                               "refines the branch against the quantization error and stops "
-                               "when it stops paying off (~5.7min at 100). The refinement "
-                               "lowers weight reconstruction error; it has not been shown to "
-                               "improve the images, so 0 is the default here.",
+                    "default": 100, "min": 0, "max": 200,
+                    "tooltip": "svdq only. 0 is a single-shot SVD split (~54s); 100 refines "
+                               "the branch against the quantization error and early-stops "
+                               "(~5.7min). Keep this on if rank > 16: refinement is what "
+                               "makes rank behave. Without it, raising rank costs file size "
+                               "and buys nothing measurable.",
                 }),
                 "groupsize": ("INT", {
                     "default": 256, "min": 32, "max": 1024, "step": 32,
@@ -105,8 +119,8 @@ class Krea2SVDQuantQuantize:
                    "loaded model to free the GPU, and writes ~8 GB. Load the result with the "
                    "Krea2 SVDQuant W4A4 Loader (svdq) or the stock UNETLoader (w4a4/int8/fp8).")
 
-    def run(self, source_model, format, rank, refine_iters, groupsize, variant, output_name,
-            overwrite):
+    def run(self, source_model, format, rank, rank_alloc, refine_iters, groupsize, variant,
+            output_name, overwrite):
         src = folder_paths.get_full_path_or_raise("diffusion_models", source_model)
 
         # `rank` always carries a value from the widget, so "was it set?" cannot be inferred
@@ -120,7 +134,7 @@ class Krea2SVDQuantQuantize:
                 name += ".safetensors"
             dst = os.path.join(os.path.dirname(src), name)
         else:
-            dst, note = derive_out_path(src, format, rank, variant)
+            dst, note = derive_out_path(src, format, rank, variant, rank_alloc)
             if note:
                 logging.info("[krea2-svdquant] %s", note)
 
@@ -150,10 +164,12 @@ class Krea2SVDQuantQuantize:
                 pbar.total = total
             pbar.update_absolute(done, total)
 
-        logging.info("[krea2-svdquant] quantizing %s -> %s (format %s, rank %s, "
-                     "refine_iters %s)", src, dst, fmt, rank, refine_iters if rank else 0)
+        logging.info("[krea2-svdquant] quantizing %s -> %s (format %s, rank %s/%s, "
+                     "refine_iters %s)", src, dst, fmt, rank, rank_alloc,
+                     refine_iters if rank else 0)
         summary = convert(src, dst, fmt, groupsize, "cuda", rank, refine_iters,
-                          variant=variant, progress_cb=progress)
+                          variant=variant, progress_cb=progress,
+                          rank_alloc=rank_alloc if rank else "uniform")
 
         hint = SAMPLER_HINTS.get(variant)
         loader = ("Krea2 SVDQuant W4A4 Loader" if rank else "the stock UNETLoader")

@@ -157,6 +157,98 @@ def leaf_name(layer: str, prefix: str) -> str | None:
     return rest.split(".", 1)[1] if "." in rest else None
 
 
+# Rank is bought in multiples of this, so a reallocated budget lands on the same grid the
+# `rank` widget and the CLI already use.
+_RANK_STEP = 8
+
+# Per-leaf rank multipliers, relative to a uniform budget.
+#
+# Uniform rank is the obvious default and the wrong one. Measured on Krea2 Turbo at rank 64,
+# error removed per million branch parameters spans 6.9x across the eight leaves:
+#
+#     attn.wk  0.0992   (1536x6144, branch 491K params, absorbs 30.1% of the error)
+#     attn.wv  0.0844   (1536x6144, 491K, 25.6%)
+#     attn.wq  0.0445   (6144x6144, 786K, 21.6%)
+#     attn.wo  0.0411   (6144x6144, 786K, 17.6%)
+#     attn.gate 0.0384  (6144x6144, 786K, 18.7%)
+#     mlp.down 0.0169   (6144x16384, 1.44M, 14.3%)
+#     mlp.gate 0.0155   (16384x6144, 1.44M, 13.8%)
+#     mlp.up   0.0143   (16384x6144, 1.44M, 12.7%)
+#
+# The cause is GQA: Krea 2 has 12 kv heads against 48 query heads, so wk/wv are 1536-wide and
+# their branch costs a third of an MLP branch -- while absorbing twice as much error. Uniform
+# rank therefore spends most of the budget on the layers that reward it least.
+#
+# These multipliers come from a greedy allocation under a fixed byte budget (branch cost is
+# exactly linear in rank, so scaling all of them preserves byte-neutrality at any base rank).
+# At base rank 64 they reproduce the solved table: wk 360, wv 256, wq 72, wo 64, gate 56,
+# mlp 8, and the checkpoint comes out 0.02% smaller than uniform rank 64.
+#
+# MEASURED, and it does not deliver. The greedy solve predicted 6% less mean layer weight
+# error; the images say otherwise. 10 prompts, seed 987654321, against the same BF16 reference:
+#
+#     uniform rank 64  LPIPS 0.3403 +-0.1019
+#     gqa     rank 64  LPIPS 0.3523 +-0.0473
+#
+# gqa is closer on 5 of 10 prompts, paired t = +0.55 on 9 df. No mean effect in either
+# direction. Two things did not survive scrutiny and are recorded so nobody re-derives them:
+# the -6% rests on an absorption ~ sqrt(rank) model fitted to nothing stronger than "returns
+# are sublinear", and the tempting pattern that gqa wins on the hard prompts is an artifact --
+# re-pairing the gqa scores at random reproduces the same -0.92 correlation, because the
+# baseline appears on both sides of the difference.
+#
+# What is left is real but narrow: the spread across prompts shrinks (variance ratio 4.64,
+# F-test p = 0.032) and the worst prompt improves, 0.4975 -> 0.4470. That is one nominally
+# significant result among several things tried on the same 10 images, so it is a lead for a
+# larger measurement, not a reason to change the default. `uniform` stays the default.
+#
+# The 6.9x spread itself is solid -- it is measured weight error over real shapes. The lesson
+# is that weight error is a poor proxy for image outcome, which is now the third time this
+# has held on this model (the refinement objective and the depth hypothesis were the others).
+_GQA_ALLOC = {
+    "attn.wk": 5.625, "attn.wv": 4.0, "attn.wq": 1.125, "attn.wo": 1.0, "attn.gate": 0.875,
+    "mlp.gate": 0.125, "mlp.up": 0.125, "mlp.down": 0.125,
+}
+
+RANK_ALLOCATIONS: dict[str, dict[str, float] | None] = {
+    "uniform": None,
+    "gqa": _GQA_ALLOC,
+}
+
+
+def leaf_ranks(rank: int, rank_alloc: str = "uniform") -> dict[str, int]:
+    """Expand a rank budget into a per-leaf rank, one entry per name in `_QUANT_SUFFIXES`.
+
+    `uniform` gives every leaf the same rank -- the historical behaviour. Other allocations
+    redistribute the same total branch bytes according to `RANK_ALLOCATIONS`.
+    """
+    if rank_alloc not in RANK_ALLOCATIONS:
+        raise RuntimeError("unknown rank allocation {!r}; expected one of {}".format(
+            rank_alloc, ", ".join(sorted(RANK_ALLOCATIONS))))
+    mults = RANK_ALLOCATIONS[rank_alloc]
+    if mults is None:
+        return {leaf: rank for leaf in _QUANT_SUFFIXES}
+
+    # Byte-neutrality is the whole point of a non-uniform allocation, and it only survives
+    # while every leaf can be expressed on the step-8 grid. Below that the smallest leaves get
+    # rounded *up* to the floor and the file grows: at budget 16 the MLP leaves want rank 2,
+    # take 8, and the checkpoint comes out 20% larger than uniform -- which would make any
+    # comparison against uniform meaningless. Refuse rather than quietly change the size.
+    smallest = min(mults.values())
+    minimum = int(math.ceil(_RANK_STEP / smallest / _RANK_STEP)) * _RANK_STEP
+    if rank < minimum:
+        raise RuntimeError(
+            "rank allocation {!r} needs a budget of at least {} (you asked for {}). Its "
+            "smallest leaf gets {}x the budget, which below that rounds up to the step-{} "
+            "floor and makes the checkpoint *larger* than uniform instead of the same size."
+            .format(rank_alloc, minimum, rank, smallest, _RANK_STEP))
+
+    out = {}
+    for leaf in _QUANT_SUFFIXES:
+        out[leaf] = int(round(rank * mults[leaf] / _RANK_STEP)) * _RANK_STEP
+    return out
+
+
 def svd_lowrank(weight: torch.Tensor, rank: int, oversample: int = 16, niter: int = 2):
     """Randomized truncated SVD: return (L1 [out, rank], L2 [rank, in]) with W ~ L1 @ L2.
 
@@ -274,8 +366,12 @@ def conf_tensor(conf: dict) -> torch.Tensor:
 
 
 def convert(src: str, dst: str, fmt: str, groupsize: int, device: str = "cuda", rank: int = 0,
-            refine_iters: int = 100, variant: str = "unknown", progress_cb=None):
+            refine_iters: int = 100, variant: str = "unknown", progress_cb=None,
+            rank_alloc: str = "uniform"):
     """Quantize `src` into `dst`. Returns the summary line it printed.
+
+    `rank` is a budget, `rank_alloc` decides how it is spread across the eight projection
+    types -- see `RANK_ALLOCATIONS`. Non-uniform allocations keep the same total branch bytes.
 
     `progress_cb(done, total, message)` is called as layers complete, for callers with a
     progress bar to drive (the ComfyUI node). Errors are `RuntimeError`, never `SystemExit`:
@@ -288,6 +384,9 @@ def convert(src: str, dst: str, fmt: str, groupsize: int, device: str = "cuda", 
     kept = 0
     branched = 0
     observed_leaves: set[str] = set()
+    ranks = leaf_ranks(rank, rank_alloc) if rank > 0 else {}
+    used_ranks: set[int] = set()
+    clamped: dict[str, int] = {}
     t0 = time.time()
 
     with safe_open(src, framework="pt", device="cpu") as handle:
@@ -314,8 +413,14 @@ def convert(src: str, dst: str, fmt: str, groupsize: int, device: str = "cuda", 
                     observed_leaves.add(leaf)
                 if is_target(layer, prefix):
                     w = dequantize_target_weight(handle, layer, device)
-                    if rank > 0:
-                        split = svdquant_split(w, rank, fmt, groupsize, refine_iters)
+                    # A reallocated budget can ask for more rank than the weight has singular
+                    # directions (attn.wk is only 1536 wide). `svd_lowrank` clamps internally,
+                    # but clamping here too keeps the reported rank honest.
+                    leaf_rank = min(ranks.get(leaf, 0), min(w.shape))
+                    if leaf and leaf_rank < ranks.get(leaf, 0):
+                        clamped[leaf] = leaf_rank
+                    if leaf_rank > 0:
+                        split = svdquant_split(w, leaf_rank, fmt, groupsize, refine_iters)
                         if split is None:
                             print("  warning: {} is degenerate (zero or non-finite); "
                                   "quantizing it without a low-rank branch".format(layer),
@@ -325,6 +430,7 @@ def convert(src: str, dst: str, fmt: str, groupsize: int, device: str = "cuda", 
                             out["{}.svdq_l1".format(layer)] = l1.cpu()
                             out["{}.svdq_l2".format(layer)] = l2.cpu()
                             branched += 1
+                            used_ranks.add(int(l1.shape[1]))
                             del l1, l2
                     qdata, scales, conf = quantize_weight(w, fmt, groupsize)
                     out[key] = qdata.cpu()
@@ -362,6 +468,17 @@ def convert(src: str, dst: str, fmt: str, groupsize: int, device: str = "cuda", 
                     ", ".join(sorted(observed_leaves)) or "none")
         )
 
+    # A leaf can only be clamped when the allocation asked for more rank than the weight is
+    # wide, which means part of the budget went unspent and the file is *smaller* than the
+    # uniform one -- so a comparison against uniform at this budget is no longer like-for-like.
+    if clamped:
+        print("warning: rank allocation {!r} asked for more rank than these layers are wide, "
+              "so they were capped and part of the budget went unspent: {}. The checkpoint is "
+              "smaller than uniform rank {}, not the same size -- lower the budget to compare "
+              "them fairly.".format(
+                  rank_alloc, ", ".join("{}={}".format(k, v) for k, v in sorted(clamped.items())),
+                  rank), flush=True)
+
     created = len(out) - kept - quantized
     factors = "" if not rank else " + {} low-rank factors".format(branched * 2)
     print(f"quantized {quantized} layers; {kept} tensors passed through; "
@@ -372,10 +489,15 @@ def convert(src: str, dst: str, fmt: str, groupsize: int, device: str = "cuda", 
     # safetensors metadata is str -> str only. The loader treats all of this as optional:
     # checkpoints published before this existed still load, with the rank recovered from
     # the svdq_l1 shape as before.
+    # The loader trusts the factor shapes over `krea2_svdquant_rank`, and under a non-uniform
+    # allocation no single number is the rank -- so record the budget, the allocation name and
+    # the full per-leaf map, and leave `rank` meaning "budget" for older loaders reading it.
     metadata = {
         "krea2_svdquant_tool_version": __version__,
         "krea2_svdquant_format": fmt,
         "krea2_svdquant_rank": str(rank),
+        "krea2_svdquant_rank_alloc": rank_alloc,
+        "krea2_svdquant_rank_map": json.dumps(ranks, sort_keys=True) if ranks else "",
         "krea2_svdquant_groupsize": str(groupsize),
         "krea2_svdquant_refine_iters": str(refine_iters if rank else 0),
         "krea2_svdquant_variant": variant,
@@ -389,8 +511,13 @@ def convert(src: str, dst: str, fmt: str, groupsize: int, device: str = "cuda", 
             sum(t.numel() * t.element_size() for t in out.values()) / 1024 ** 3))
     save_file(out, dst, metadata=metadata)
     size = os.path.getsize(dst) / 1024 ** 3
-    summary = ("quantized {} layers ({} branched) in {:.0f}s -> {}  ({:.2f} GB, source "
-               "{:.2f} GB)".format(quantized, branched, time.time() - t0, dst, size,
+    rank_desc = ""
+    if used_ranks:
+        rank_desc = (" rank {}".format(next(iter(used_ranks))) if len(used_ranks) == 1
+                     else " rank {}-{} ({})".format(min(used_ranks), max(used_ranks),
+                                                    rank_alloc))
+    summary = ("quantized {} layers ({} branched{}) in {:.0f}s -> {}  ({:.2f} GB, source "
+               "{:.2f} GB)".format(quantized, branched, rank_desc, time.time() - t0, dst, size,
                                    os.path.getsize(src) / 1024 ** 3))
     print("done in {:.0f}s -> {}  ({:.2f} GB, source {:.2f} GB)".format(
         time.time() - t0, dst, size, os.path.getsize(src) / 1024 ** 3))
@@ -438,7 +565,8 @@ def resolve_format(fmt_name: str, rank: int, rank_was_set: bool = True) -> tuple
     return fmt, (rank if fmt_name == "svdq" else 0)
 
 
-def derive_out_path(src: str, fmt_name: str, rank: int, variant: str) -> tuple[str, str | None]:
+def derive_out_path(src: str, fmt_name: str, rank: int, variant: str,
+                    rank_alloc: str = "uniform") -> tuple[str, str | None]:
     """The default output path, plus a note to show when the source name is uninformative."""
     stem = os.path.splitext(os.path.basename(src))[0]
     note = None
@@ -448,7 +576,10 @@ def derive_out_path(src: str, fmt_name: str, rank: int, variant: str) -> tuple[s
         note = ("note: '{}' is a generic filename. Set the variant (or an explicit output "
                 "name) to get a checkpoint name you will still recognise next month."
                 .format(stem))
-    suffix = ("SVDQuant-W4A4-rank{}".format(rank) if rank else
+    # The allocation goes in the filename because two checkpoints with the same budget and
+    # different allocations are the same size -- nothing else would tell them apart.
+    alloc_tag = "" if rank_alloc == "uniform" else "-{}".format(rank_alloc)
+    suffix = ("SVDQuant-W4A4-rank{}{}".format(rank, alloc_tag) if rank else
               ("{}-convrot".format(fmt_name.upper()) if fmt_name != "fp8" else "FP8"))
     return os.path.join(os.path.dirname(src), "{}-{}.safetensors".format(stem, suffix)), note
 
@@ -460,7 +591,12 @@ def main():
                     help="svdq = w4a4 residual + SVDQuant low-rank bf16 branch; "
                          "fp8 = float8_e4m3fn, no convrot, no low-rank branch")
     ap.add_argument("--groupsize", type=int, default=256, help="unused for fp8")
-    ap.add_argument("--rank", type=int, default=64, help="low-rank size, svdq only")
+    ap.add_argument("--rank", type=int, default=64, help="low-rank branch budget, svdq only")
+    ap.add_argument("--rank-alloc", choices=sorted(RANK_ALLOCATIONS), default="uniform",
+                    help="how to spread the rank budget across the eight projection types. "
+                         "uniform = same rank everywhere. gqa = byte-neutral reallocation "
+                         "towards the GQA kv projections, which absorb ~2x the error at a "
+                         "third of the branch cost (see RANK_ALLOCATIONS)")
     ap.add_argument("--refine-iters", type=int, default=100,
                     help="svdq only: refine the low-rank branch against the quantization "
                          "error, keeping the best (0 = plain single-shot SVD, much faster "
@@ -481,14 +617,17 @@ def main():
     except RuntimeError as exc:
         raise SystemExit(str(exc)) from None
 
+    if args.rank_alloc != "uniform" and not rank:
+        raise SystemExit("--rank-alloc only applies to format 'svdq'")
+
     out = args.out
     if out is None:
-        out, note = derive_out_path(args.src, args.format, rank, args.variant)
+        out, note = derive_out_path(args.src, args.format, rank, args.variant, args.rank_alloc)
         if note:
             print(note, flush=True)
     try:
         convert(args.src, out, fmt, args.groupsize, args.device, rank, args.refine_iters,
-                variant=args.variant)
+                variant=args.variant, rank_alloc=args.rank_alloc)
     except RuntimeError as exc:
         raise SystemExit(str(exc)) from None
 
