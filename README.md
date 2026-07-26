@@ -265,6 +265,12 @@ sample data, which is what makes their conversions take hours rather than minute
 
 ## Benchmarks
 
+> **Community rank sweep + krea2edit LoRA test:** a full rank-16-through-256 comparison
+> (refined and non-refined) across 10 stress-test prompts, plus the same sweep run through
+> the [Krea 2 Identity Edit LoRA](https://github.com/lbouaraba/comfyui-krea2edit) on 3 real
+> photos (Paris/horse/night edits). Grids, prompts, and speed+quality tables:
+> [BENCHMARKS.md](BENCHMARKS.md).
+
 All numbers measured on an **RTX 3090 24GB**, 1024x1024, 8-step Euler/simple sampling,
 `cfg=1.0` (Krea 2 Turbo distilled schedule), from the same BF16 source checkpoint, on a
 **cu130 torch build** (see [Troubleshooting](#troubleshooting) — on an older build every
