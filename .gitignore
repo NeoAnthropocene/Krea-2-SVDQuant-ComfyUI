@@ -1,3 +1,11 @@
 __pycache__/
 *.py[cod]
 *.safetensors
+
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.egg-info/
+build/
+dist/

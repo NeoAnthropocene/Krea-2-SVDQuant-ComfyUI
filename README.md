@@ -4,19 +4,18 @@
 [huggingface.co/AlperKTS/Krea-2-SVDQuant-ComfyUI](https://huggingface.co/AlperKTS/Krea-2-SVDQuant-ComfyUI)
 
 This repo holds the ComfyUI custom nodes and the `quantize_krea2.py` conversion script.
-The `.safetensors` checkpoints (7.5-8.3 GB each) are hosted on Hugging Face, not here.
+The `.safetensors` checkpoints (7.5-9.1 GB each) are hosted on Hugging Face, not here.
 Clone this repo into `custom_nodes/`, then download whichever checkpoint you want from
 the Hugging Face repo above into `ComfyUI/models/diffusion_models/`.
 
-License: this project modifies Krea 2 and is distributed under the [Krea 2 Community
-License Agreement](https://www.krea.ai/krea-2-licensing) - see [LICENSE.md](LICENSE.md).
-Not an official Krea product.
-
 Quantized **Krea 2** checkpoints for ComfyUI — about **2x faster** and **a third the
-size** of the usual FP8 version, with no calibration dataset needed. Download a
-checkpoint, install the custom nodes, load the included workflow, done. Works on both
-**Krea 2 Turbo** (distilled, 8 steps) and the **base** release (~50 steps with real CFG);
-the conversion is identical for both, only the sampler settings differ.
+size** of the usual FP8 version, with no calibration dataset needed, on both **Krea 2
+Turbo** (distilled, 8 steps) and the **base** release (~50 steps with real CFG; the
+conversion is identical, only the sampler settings differ). This is an experimental,
+built-from-scratch project — the quantization script, loader node, and LoRA node were
+all written for this repo against ComfyUI's own quantization backend, and are fully
+reproducible (`quantize_krea2.py` regenerates any checkpoint here from a BF16 source in
+40-100 seconds, or ~6 minutes with low-rank refinement, the default for `--format svdq`).
 
 Works on **any modern NVIDIA GPU** — INT8/W4A4 tensor cores go back to Turing (RTX
 20-series and up). Benchmarked on an RTX 3090 (Ampere, sm_86), which is the case most
@@ -29,17 +28,9 @@ NVFP4 tensor cores at all.
 > are slower than FP8 for you, this is almost certainly why — see
 > [Troubleshooting](#troubleshooting).
 
-This is an experimental, built-from-scratch project: the quantization script, the loader
-node, and the LoRA node here were all written for this repo against ComfyUI's own
-quantization backend. Everything is reproducible — `quantize_krea2.py` regenerates any of
-these checkpoints from a BF16 Krea 2 model in 40-100 seconds, or about 6 minutes with the
-low-rank refinement pass enabled (the default for `--format svdq`).
-
-This is a **community-produced modification of Krea 2** and is **not an official Krea
-product**. Krea 2 is licensed under the [Krea 2 Community License
-Agreement](https://www.krea.ai/krea-2-licensing); this repository and its checkpoints are
-distributed under the same terms — read them before using these weights, in particular
-the revenue threshold on commercial use.
+This is a community-produced modification of Krea 2, not an official Krea product —
+license and attribution details are at the [bottom of this README](#attribution); read
+them before using these weights, in particular the revenue threshold on commercial use.
 
 ## Quick start
 
@@ -114,7 +105,8 @@ checkpoints need the **Krea2 SVDQuant W4A4 Loader** node from this repo (they ca
 
 Higher rank = larger low-rank correction branch = closer to the unquantized model. All three
 are built with `refine_iters=100`, which is what makes that true — see
-[the rank/refine section](#rank-and-refine_iters-are-one-lever-not-two). Branch
+the rank/refine section under [Quantize your own
+checkpoint](#quantize-your-own-checkpoint). Branch
 reconstruction error over four sampled layers: 0.127 at rank 16, 0.098 at rank 64, 0.080 at
 rank 128.
 
@@ -128,9 +120,10 @@ with safe_open("Krea2-Turbo-SVDQuant-W4A4-rank64.safetensors", framework="pt") a
     print(f.metadata())
 ```
 
-> Builds published before 2026-07-26 carry no metadata and were made **without** refinement.
-> If `f.metadata()` returns `None`, re-download — at rank 128 the unrefined build measures
-> 0.095 against the refined 0.080, and the whole rank ladder is flat without refinement.
+> The test that matters is `f.metadata() is None`, not the date: an early batch (published
+> before 2026-07-26) was built without refinement and carries no metadata at all. If yours
+> returns `None`, re-download — at rank 128 the unrefined build measures 0.095 against the
+> refined 0.080, and the whole rank ladder is flat without refinement.
 
 Rank 32 and 256 were also produced and benchmarked during development but are not included
 in this upload; `quantize_krea2.py` reproduces them exactly (`--rank 32` / `--rank 256`).
@@ -146,6 +139,7 @@ in this upload; `quantize_krea2.py` reproduces them exactly (`--rank 32` / `--ra
 | `svdquant_diag.py` | The **Krea2 SVDQuant Diagnostics** and **Krea2 SVDQuant Env Check** nodes — which kernel actually runs, plus memory accounting and per-layer timings |
 | `diagnose.py` | The same reports from a terminal, without starting ComfyUI |
 | `tools/build_workflows.py` | Regenerates `workflows/*.json`. Edit this, not the JSON |
+| `tools/pixel_metrics.py` | LPIPS/PSNR/SSIM against a BF16 reference — see [Benchmarks](#benchmarks) |
 | `workflows/*.json` | Example workflows — see the format note below |
 
 Installing this adds five nodes, all under the **Krea2/SVDQuant** category:
@@ -211,18 +205,24 @@ has 12 kv heads against 48 query heads, so `wk`/`wv` are 1536-wide and their bra
 third of an MLP branch while absorbing twice as much error.
 
 `--rank-alloc gqa` spends the same bytes accordingly (`wk` 360, `wv` 256, `wq` 72, `wo` 64,
-`gate` 56, MLP 8 — 0.02% smaller than uniform rank 64, same speed at 7.1 s/image).
+`gate` 56, MLP 8 — 0.02% smaller than uniform rank 64, same speed at 7.1 s/image). **It
+does not improve the images** — measured, not assumed; `uniform` stays the default.
 
-**It does not improve the images.** LPIPS 0.3523 against uniform's 0.3403, better on 5 of 10
-prompts, paired t = +0.55 on 9 df — no effect in either direction. The greedy solve predicted
-6% less weight error and that did not translate. It does halve the spread across prompts
-(variance ratio 4.64, F-test p = 0.032) and improve the worst prompt, 0.4975 → 0.4470, which is
-worth someone re-testing at more than 10 images but is not a reason to change the default.
+<details>
+<summary>Why it's kept despite not helping (measured LPIPS, what the greedy solve got wrong)</summary>
+
+LPIPS 0.3523 against uniform's 0.3403, better on 5 of 10 prompts, paired t = +0.55 on 9 df
+— no effect in either direction. The greedy solve predicted 6% less weight error and that
+did not translate. It does halve the spread across prompts (variance ratio 4.64, F-test
+p = 0.032) and improve the worst prompt, 0.4975 → 0.4470, which is worth someone
+re-testing at more than 10 images but is not a reason to change the default.
 
 Kept because the mechanism is sound and the option is cheap to leave in. The transferable
-result is negative: weight reconstruction error is a poor predictor of image outcome on this
-model — three separate attempts to optimise against it (the refinement objective, per-block
-depth allocation, this) have failed to move LPIPS in the predicted direction.
+result is negative: weight reconstruction error is a poor predictor of image outcome on
+this model — three separate attempts to optimise against it (the refinement objective,
+per-block depth allocation, this) have failed to move LPIPS in the predicted direction.
+
+</details>
 
 Add `--variant turbo` or `--variant base` to get a checkpoint name you'll still recognise
 later (`Krea2-Base-SVDQuant-W4A4-rank64.safetensors`) and to record which release it came
@@ -257,11 +257,16 @@ refining can never do worse. It costs conversion time: roughly **6 minutes** ins
 python quantize_krea2.py model.safetensors --format svdq --rank 64 --refine-iters 0
 ```
 
+<details>
+<summary>What the objective is, and the remaining gap to DeepCompressor</summary>
+
 The objective here is weight reconstruction error, which needs no calibration data — it
 is the true output error under the assumption that the input covariance is identity, and
 spreading outliers with the convrot rotation is what makes that assumption reasonable.
 Closing the rest of the gap to DeepCompressor means measuring the real covariance from
 sample data, which is what makes their conversions take hours rather than minutes.
+
+</details>
 
 ## Benchmarks
 
@@ -347,6 +352,12 @@ quality matters more than raw speed; `svdq` is the faster, smaller choice.**
 This is an experimental project — the rank sweep is deliberately shipped so people can
 try the tradeoff themselves rather than take one number on faith. If you benchmark other
 ranks or find a case where one clearly wins, open a discussion on this repo.
+
+To measure it yourself against a BF16 reference: generate matching prompts across
+checkpoints into one output folder, then `python tools/pixel_metrics.py --dir
+<output-dir>` — it pairs files by name (`bench_<checkpoint>_<prompt>_00001_.png`),
+reports LPIPS/PSNR/SSIM per checkpoint, and `--noise-floor` gives you the reseed
+distance to judge drift against (see the tool's own docstring for details).
 
 ### Where the remaining time goes (profiled, `svdq r64`, single denoise step, 175.7 ms)
 
@@ -523,7 +534,7 @@ details vary, which is normal sampling variance, not a quantization artifact.
 
 | BF16 (reference) | SVDQuant rank 64 |
 |---|---|
-| ![bf16](examples/ice_cream_multisubject_test/cmp2_bf16_reference_00001_.png) | ![r64](examples/ice_cream_multisubject_test/cmp2_svdq_r64_00001_.png) |
+| ![bf16](examples/ice_cream_multisubject_test/compare_bf16_reference_00001_.png) | ![r64](examples/ice_cream_multisubject_test/compare_svdq_r64_00001_.png) |
 
 <details>
 <summary>All 9 variants for this prompt</summary>
@@ -536,7 +547,8 @@ details vary, which is normal sampling variance, not a quantization artifact.
 
 Krea 2 is developed by [Krea AI](https://www.krea.ai). This repository contains
 derivative, modified weights and is licensed under the same [Krea 2 Community License
-Agreement](https://www.krea.ai/krea-2-licensing) as the base model. It is a
+Agreement](https://www.krea.ai/krea-2-licensing) as the base model — see
+[LICENSE.md](LICENSE.md) for the full terms and how they apply to the code here. It is a
 community contribution, not an official Krea product, and is not endorsed by Krea.
 
 The quantization kernels used here (`int8_tensorwise`, `convrot_w4a4`) are native to
