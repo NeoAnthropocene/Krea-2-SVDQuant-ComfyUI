@@ -1,8 +1,8 @@
 {
   "id": "00000000-0000-4000-8000-000000000000",
   "revision": 0,
-  "last_node_id": 10,
-  "last_link_id": 9,
+  "last_node_id": 11,
+  "last_link_id": 10,
   "nodes": [
     {
       "id": 1,
@@ -13,7 +13,7 @@
       ],
       "size": [
         400,
-        560
+        620
       ],
       "flags": {},
       "order": 0,
@@ -24,7 +24,7 @@
         "Node name for S&R": "Note"
       },
       "widgets_values": [
-        "KREA 2 BASE (non-turbo) - SVDQuant W4A4\n\nThe loader node will be outlined in RED when you open this. That is\nexpected: the filename it wants does not exist until you build it in\nstep 1, and ComfyUI flags any dropdown value it cannot find. Build the\ncheckpoint, then reselect it in the loader.\n\n1. There is no pre-built base checkpoint to download. Make one:\n\n     python quantize_krea2.py raw.safetensors \\\n         --format svdq --rank 64 --variant base\n\n   That writes Krea2-Base-SVDQuant-W4A4-rank64.safetensors next to\n   the source. ~54s without refinement, ~5.7min with it.\n   The Krea2 SVDQuant Quantize node does the same thing from inside\n   ComfyUI if you would rather not touch a terminal.\n\n2. Unlike Turbo, this model is NOT cfg-distilled, so it uses real\n   classifier-free guidance: cfg 3.5 and a real negative prompt\n   (a second CLIPTextEncode, not ConditioningZeroOut).\n   ~50 steps. These are starting points, tune them.\n\n3. This is roughly 12x the sampling work of the 8-step Turbo graph.\n   Every benchmark number in the README is Turbo at 8 steps - the\n   ratios carry over, the absolute seconds do not.\n\n4. Text encoder and VAE are the same as the Turbo graph.\n   Same slow-generation checklist too: read the loader's status\n   output first."
+        "KREA 2 TURBO - SVDQuant W4A4\n\n1. Checkpoint goes in ComfyUI/models/diffusion_models/.\n   This graph expects an svdq checkpoint (it carries *.svdq_l1 /\n   *.svdq_l2 tensors). The --format w4a4 / int8 / fp8 files have no\n   low-rank branch and load with the stock UNETLoader instead.\n\n2. cfg MUST be 1.0. Krea 2 Turbo is cfg-distilled, so the negative\n   prompt is zeroed out (ConditioningZeroOut) rather than encoded.\n   Raising cfg here degrades the image, it does not sharpen it.\n   8 steps is what the checkpoint was distilled for.\n\n3. Text encoder: any Qwen3-VL 4B in ComfyUI/models/text_encoders/,\n   loaded with CLIPLoader type \"krea2\".\n   VAE: qwen_image_vae.safetensors.\n\n4. SLOW? Read the loader's \"status\" output. It names the kernel that\n   will actually run. If it does not say cuda, ComfyUI has disabled\n   comfy_kitchen's CUDA backend because torch was built against\n   CUDA < 13 -- and the fallback dequantizes int4 in Python, so the\n   checkpoint ends up slower than fp8. Install a cu130+ torch build.\n   The Krea2 SVDQuant Env Check node answers this with no model loaded.\n\n5. LoRA: use the Krea2 SVDQuant LoRA Loader, not the stock one. The\n   stock loader cannot patch a quantized weight and skips the blocks."
       ],
       "title": "READ ME FIRST",
       "color": "#432",
@@ -50,7 +50,8 @@
           "name": "MODEL",
           "type": "MODEL",
           "links": [
-            1
+            1,
+            10
           ],
           "slot_index": 0
         },
@@ -65,9 +66,9 @@
         "Node name for S&R": "Krea2SVDQuantW4A4Loader"
       },
       "widgets_values": [
-        "Krea2-Base-SVDQuant-W4A4-rank64.safetensors"
+        "Krea2-Turbo-SVDQuant-W4A4-rank64.safetensors"
       ],
-      "title": "Krea2 SVDQuant W4A4 Loader (base)",
+      "title": "Krea2 SVDQuant W4A4 Loader",
       "color": "#233",
       "bgcolor": "#355"
     },
@@ -91,8 +92,7 @@
           "name": "CLIP",
           "type": "CLIP",
           "links": [
-            2,
-            3
+            2
           ],
           "slot_index": 0
         }
@@ -153,7 +153,7 @@
       ],
       "size": [
         400,
-        200
+        220
       ],
       "flags": {},
       "order": 4,
@@ -170,6 +170,7 @@
           "name": "CONDITIONING",
           "type": "CONDITIONING",
           "links": [
+            3,
             4
           ],
           "slot_index": 0
@@ -181,28 +182,28 @@
       "widgets_values": [
         "A cluttered antique clockmaker's workshop seen through a cracked magnifying glass, brass gears laid out in a spiral on the workbench, a ginger cat asleep on a stack of leather-bound books, warm afternoon light with visible dust motes, photorealistic, 85mm lens, shallow depth of field"
       ],
-      "title": "Positive prompt",
+      "title": "Prompt",
       "color": "#232",
       "bgcolor": "#353"
     },
     {
       "id": 6,
-      "type": "CLIPTextEncode",
+      "type": "ConditioningZeroOut",
       "pos": [
         900,
-        320.0
+        340.0
       ],
       "size": [
         400,
-        140
+        60
       ],
       "flags": {},
       "order": 5,
       "mode": 0,
       "inputs": [
         {
-          "name": "clip",
-          "type": "CLIP",
+          "name": "conditioning",
+          "type": "CONDITIONING",
           "link": 3
         }
       ],
@@ -217,12 +218,10 @@
         }
       ],
       "properties": {
-        "Node name for S&R": "CLIPTextEncode"
+        "Node name for S&R": "ConditioningZeroOut"
       },
-      "widgets_values": [
-        "blurry, low resolution, jpeg artifacts, watermark, deformed, extra limbs"
-      ],
-      "title": "Negative prompt (base uses real CFG)",
+      "widgets_values": [],
+      "title": "Negative (zeroed - required at cfg 1.0)",
       "color": "#232",
       "bgcolor": "#353"
     },
@@ -231,7 +230,7 @@
       "type": "EmptySD3LatentImage",
       "pos": [
         900,
-        520.0
+        500.00000000000006
       ],
       "size": [
         400,
@@ -315,13 +314,13 @@
       "widgets_values": [
         987654321,
         "randomize",
-        50,
-        3.5,
+        8,
+        1.0,
         "euler",
         "simple",
         1.0
       ],
-      "title": "KSampler - 50 steps, cfg 3.5",
+      "title": "KSampler - 8 steps, cfg 1.0",
       "color": "#323",
       "bgcolor": "#535"
     },
@@ -395,11 +394,57 @@
         "Node name for S&R": "SaveImage"
       },
       "widgets_values": [
-        "krea2_base_svdq"
+        "krea2_turbo_svdq"
       ],
       "title": "Save",
       "color": "#323",
       "bgcolor": "#535"
+    },
+    {
+      "id": 11,
+      "type": "Krea2SVDQuantDiagnostics",
+      "pos": [
+        1320,
+        540.0
+      ],
+      "size": [
+        400,
+        130
+      ],
+      "flags": {},
+      "order": 10,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 10
+        }
+      ],
+      "outputs": [
+        {
+          "name": "MODEL",
+          "type": "MODEL",
+          "links": [],
+          "slot_index": 0
+        },
+        {
+          "name": "STRING",
+          "type": "STRING",
+          "links": [],
+          "slot_index": 1
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "Krea2SVDQuantDiagnostics"
+      },
+      "widgets_values": [
+        "dispatch",
+        4096
+      ],
+      "title": "Diagnostics (optional - run if slow)",
+      "color": "#432",
+      "bgcolor": "#653"
     }
   ],
   "links": [
@@ -421,11 +466,11 @@
     ],
     [
       3,
-      3,
+      5,
       0,
       6,
       0,
-      "CLIP"
+      "CONDITIONING"
     ],
     [
       4,
@@ -474,6 +519,14 @@
       10,
       0,
       "IMAGE"
+    ],
+    [
+      10,
+      2,
+      0,
+      11,
+      0,
+      "MODEL"
     ]
   ],
   "groups": [
@@ -483,7 +536,7 @@
         500,
         20,
         420,
-        560
+        620
       ],
       "color": "#3f789e",
       "font_size": 24,

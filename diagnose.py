@@ -60,7 +60,7 @@ def main() -> int:
     tokens = args.tokens or diag._DEFAULT_TOKENS
 
     if args.no_load:
-        print(_backend_status(diag))
+        print(diag.report_backend_status())
         return 0
 
     if not args.checkpoint:
@@ -83,38 +83,6 @@ def main() -> int:
         print()
         print(diag.run_report(patcher, mode, tokens), flush=True)
     return 0
-
-
-def _backend_status(diag) -> str:
-    """The subset of the `dispatch` report that needs no model."""
-    import torch
-
-    lines = ["torch {}  (cuda build {})".format(torch.__version__, torch.version.cuda), ""]
-    if diag.ck_registry is None:
-        lines.append("comfy_kitchen unavailable: {}".format(diag._CK_IMPORT_ERROR))
-        return "\n".join(lines)
-
-    for name, info in sorted(diag.ck_registry.list_backends().items()):
-        lines.append("{:<8} available={:<5} disabled={:<5} implements {}={:<5} reason={}".format(
-            name, str(info["available"]), str(info["disabled"]), diag._FUNC,
-            str(diag._FUNC in info["capabilities"]), info["unavailable_reason"] or "-"))
-
-    active = [n for n, i in diag.ck_registry.list_backends().items()
-              if i["available"] and not i["disabled"] and diag._FUNC in i["capabilities"]]
-    lines.append("")
-    if "cuda" in active:
-        lines.append("cuda backend is live -- the int4 tensor-core kernel is available.")
-    else:
-        lines.append(
-            "cuda backend is NOT live. convrot_w4a4 will fall back to {}, which unpacks "
-            "int4 to bf16 in Python -- expect this checkpoint to be slower than fp8."
-            .format(active or "nothing"))
-        cuda_build = torch.version.cuda
-        if cuda_build is None or int(str(cuda_build).split(".")[0]) < 13:
-            lines.append(
-                "ComfyUI disables comfy_kitchen's CUDA backend on torch built against "
-                "CUDA < 13 (comfy/quant_ops.py). Install a cu130 or newer torch build.")
-    return "\n".join(lines)
 
 
 if __name__ == "__main__":

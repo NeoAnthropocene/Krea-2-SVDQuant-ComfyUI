@@ -1,0 +1,57 @@
+{
+  "1": {
+    "class_type": "Krea2SVDQuantW4A4Loader",
+    "_meta": {"title": "Krea2 Base SVDQuant W4A4 (rank 64)"},
+    "inputs": {"model_name": "Krea2-Base-SVDQuant-W4A4-rank64.safetensors"}
+  },
+  "2": {
+    "class_type": "CLIPLoader",
+    "_meta": {"title": "Text encoder (Qwen3-VL 4B)"},
+    "inputs": {"clip_name": "qwen3vl_4b_fp8_scaled.safetensors", "type": "krea2", "device": "default"}
+  },
+  "3": {
+    "class_type": "VAELoader",
+    "_meta": {"title": "VAE"},
+    "inputs": {"vae_name": "qwen_image_vae.safetensors"}
+  },
+  "4": {
+    "class_type": "CLIPTextEncode",
+    "_meta": {"title": "Positive prompt"},
+    "inputs": {
+      "text": "A photorealistic portrait of a snow leopard resting on a mossy rock in a misty alpine forest at dawn, golden rim light, shallow depth of field, 85mm lens, ultra detailed fur",
+      "clip": ["2", 0]
+    }
+  },
+  "5": {
+    "class_type": "CLIPTextEncode",
+    "_meta": {"title": "Negative prompt (base model uses real CFG)"},
+    "inputs": {
+      "text": "blurry, low resolution, jpeg artifacts, watermark, text, deformed, extra limbs",
+      "clip": ["2", 0]
+    }
+  },
+  "6": {
+    "class_type": "EmptySD3LatentImage",
+    "_meta": {"title": "Latent 1024x1024"},
+    "inputs": {"width": 1024, "height": 1024, "batch_size": 1}
+  },
+  "7": {
+    "class_type": "KSampler",
+    "_meta": {"title": "KSampler (base: 50 steps, cfg 3.5)"},
+    "inputs": {
+      "seed": 987654321, "steps": 50, "cfg": 3.5, "sampler_name": "euler",
+      "scheduler": "simple", "denoise": 1.0,
+      "model": ["1", 0], "positive": ["4", 0], "negative": ["5", 0], "latent_image": ["6", 0]
+    }
+  },
+  "8": {
+    "class_type": "VAEDecode",
+    "_meta": {"title": "VAE Decode"},
+    "inputs": {"samples": ["7", 0], "vae": ["3", 0]}
+  },
+  "9": {
+    "class_type": "SaveImage",
+    "_meta": {"title": "Save"},
+    "inputs": {"images": ["8", 0], "filename_prefix": "krea2_base_svdq_w4a4"}
+  }
+}

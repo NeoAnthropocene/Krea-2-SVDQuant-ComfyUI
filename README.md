@@ -59,14 +59,16 @@ the revenue threshold on commercial use.
    - [`qwen3vl_4b_fp8_scaled.safetensors`](https://huggingface.co/Comfy-Org/Krea-2/resolve/main/text_encoders/qwen3vl_4b_fp8_scaled.safetensors) → `ComfyUI/models/text_encoders/`
    - [`qwen_image_vae.safetensors`](https://huggingface.co/Comfy-Org/Krea-2/resolve/main/vae/qwen_image_vae.safetensors) → `ComfyUI/models/vae/`
 
-4. **Load a workflow.** Drag one of the JSON files from the `workflows/` folder here
-   into ComfyUI, pick your checkpoint in the loader node, and generate. (These are saved
-   in ComfyUI's *API* format — they import and run fine, they just arrive without a
-   saved node layout.)
+4. **Load a workflow.** Drag one of these from the `workflows/` folder into ComfyUI, pick
+   your checkpoint in the loader node, and generate. Each one opens with a **READ ME FIRST**
+   note covering the settings that matter.
 
-   - `krea2_svdquant_w4a4_t2i.json` → **Turbo**: 8 steps, `cfg 1.0`, zeroed negative.
+   - `krea2_turbo_svdquant_w4a4_t2i.json` → **Turbo**: 8 steps, `cfg 1.0`, zeroed negative.
    - `krea2_base_svdquant_w4a4_t2i.json` → **base**: 50 steps, `cfg 3.5`, real negative
      prompt. Treat those as a starting point and tune them.
+
+   The matching `*_api.json` files are for POSTing to `/prompt` from a script — don't drag
+   those in, they carry no layout.
 
    - `Krea2-Turbo-W4A4-noLowRank.safetensors` → use the normal **UNETLoader** node.
    - Any `SVDQuant-W4A4-rank*` checkpoint → use the **Krea2 SVDQuant W4A4 Loader**
@@ -123,14 +125,37 @@ are not included in this upload; the `quantize_krea2.py` script reproduces them 
 | `quantize_krea2.py` | Converts a BF16 Krea 2 checkpoint to int8, w4a4, or w4a4 + low-rank (svdq) |
 | `svdquant_w4a4.py` | The **Krea2 SVDQuant W4A4 Loader** node — loads `--format svdq` checkpoints (self-contained, no base model needed) |
 | `svdquant_lora.py` | The **Krea2 SVDQuant LoRA Loader** node — the stock ComfyUI LoRA loader silently skips the quantized layers on these models |
-| `svdquant_diag.py` | The **Krea2 SVDQuant Diagnostics** node — reports which kernel actually runs, plus memory accounting and per-layer timings |
+| `svdquant_quantize.py` | The **Krea2 SVDQuant Quantize** node — the quantizer above, run from inside ComfyUI instead of a terminal |
+| `svdquant_diag.py` | The **Krea2 SVDQuant Diagnostics** and **Krea2 SVDQuant Env Check** nodes — which kernel actually runs, plus memory accounting and per-layer timings |
 | `diagnose.py` | The same reports from a terminal, without starting ComfyUI |
-| `workflows/*.json` | Example ComfyUI workflows (turbo and base) |
+| `tools/build_workflows.py` | Regenerates `workflows/*.json`. Edit this, not the JSON |
+| `workflows/*.json` | Example workflows — see the format note below |
 
-Installing this adds three nodes: **Krea2 SVDQuant W4A4 Loader**, **Krea2 SVDQuant LoRA
-Loader**, and **Krea2 SVDQuant Diagnostics** — see [Quick start](#quick-start) above.
+Installing this adds five nodes, all under the **Krea2/SVDQuant** category:
+
+| node | what it is for |
+|---|---|
+| **Krea2 SVDQuant W4A4 Loader** | Loads an `svdq` checkpoint. Its `status` output names the kernel that will actually run — read it first if generation is slow |
+| **Krea2 SVDQuant LoRA Loader** | LoRAs and LoKrs on quantized blocks |
+| **Krea2 SVDQuant Quantize** | Builds a quantized checkpoint without leaving ComfyUI. Blocks the queue while it runs (54 s to ~6 min) and writes ~8 GB |
+| **Krea2 SVDQuant Diagnostics** | Backend dispatch, memory accounting, per-layer timings, profiler table |
+| **Krea2 SVDQuant Env Check** | Is the int4 kernel available at all? Needs no model, so you can ask before downloading 8 GB |
+
+### Two workflow formats, and why
+
+ComfyUI has two JSON dialects and mixing them up is a bad first five minutes:
+
+- `workflows/krea2_*_t2i.json` — **UI format.** Drag these into the ComfyUI canvas. They
+  carry layout, node titles, colours, and a **READ ME FIRST** note with the settings that
+  matter and the slow-generation checklist.
+- `workflows/krea2_*_t2i_api.json` — **API format.** What you POST to `/prompt` from a
+  script. No layout; dragging one in gives you a pile of untitled nodes.
+
+Regenerate the UI ones with `python tools/build_workflows.py` rather than editing the JSON.
 
 ### Quantize your own checkpoint
+
+Either from a terminal:
 
 ```bash
 cd ComfyUI/custom_nodes/krea2-svdquant
@@ -138,6 +163,21 @@ python quantize_krea2.py /path/to/krea2_bf16.safetensors --format int8
 python quantize_krea2.py /path/to/krea2_bf16.safetensors --format w4a4
 python quantize_krea2.py /path/to/krea2_bf16.safetensors --format svdq --rank 64
 ```
+
+…or with the **Krea2 SVDQuant Quantize** node, which calls the same code with no terminal
+involved: drop the source checkpoint in `models/diffusion_models/`, pick it in the node, and
+queue. Three things to know before you do:
+
+- **It blocks the queue** for the whole run — 54 s for a single-shot split, ~5.7 min with
+  `refine_iters=100`, measured on a 3090. Nothing else generates meanwhile.
+- **It takes the GPU.** Any loaded model is unloaded first, so your next generation pays a
+  reload.
+- **It writes ~8 GB**, and refuses rather than overwriting unless you tick `overwrite`.
+
+The node defaults `refine_iters` to **0**. The refinement loop provably lowers weight
+reconstruction error, but it has not been shown to improve the images — see
+[accuracy](#accuracy-vs-the-base-model-qualitatively) — so paying 6x the conversion time for
+it is opt-in, not the default.
 
 Add `--variant turbo` or `--variant base` to get a checkpoint name you'll still recognise
 later (`Krea2-Base-SVDQuant-W4A4-rank64.safetensors`) and to record which release it came

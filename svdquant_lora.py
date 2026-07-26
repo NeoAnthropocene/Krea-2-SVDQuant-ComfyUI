@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections import OrderedDict
 
 import torch
 
@@ -37,6 +38,7 @@ import comfy.lora
 import comfy.utils
 import folder_paths
 
+from .svdquant_diag import _CATEGORY, quantized_linears
 from .svdquant_w4a4 import add_low_rank, has_branch
 
 _DOWN_SUFFIXES = (".lora_A.weight", ".lora_down.weight", ".lora.down.weight")
@@ -45,7 +47,7 @@ _PREFIX = "diffusion_model."
 
 # Reloading a 300 MB LoRA off disk on every graph execution is pure latency when the
 # usual edit is a strength slider. Keyed on mtime+size so editing the file invalidates.
-_LORA_CACHE: dict[str, tuple[tuple, dict]] = {}
+_LORA_CACHE: OrderedDict[str, tuple[tuple, dict]] = OrderedDict()
 _LORA_CACHE_MAX = 4
 
 
@@ -54,6 +56,9 @@ def _load_lora_cached(path: str) -> dict:
     stamp = (stat.st_mtime_ns, stat.st_size)
     hit = _LORA_CACHE.get(path)
     if hit is not None and hit[0] == stamp:
+        # Without this the eviction below is insertion-ordered (FIFO), so cycling five LoRAs
+        # can drop the one being used every run.
+        _LORA_CACHE.move_to_end(path)
         return hit[1]
     sd = comfy.utils.load_torch_file(path, safe_load=True)
     if len(_LORA_CACHE) >= _LORA_CACHE_MAX:
@@ -93,13 +98,18 @@ def _split_lora(lora_sd, quant_layers: set[str]):
 
 
 def _make_lora_forward(module, l1: torch.Tensor, l2: torch.Tensor):
-    """A forward that is "quantized weight + svdq branch + this LoRA".
+    """A forward that is "quantized weight + svdq branch (if any) + this LoRA".
 
     Built on `module._krea2_forward` rather than `module.forward` so that it composes with
     the svdq branch but never with a previously installed LoRA patch -- each patcher owns
     the whole LoRA stack and rebuilds it from scratch.
+
+    A no-low-rank checkpoint has quantized layers with no branch and therefore no
+    `_krea2_forward`; there the module's own forward already *is* "quantized weight", so it
+    is the right base. Object patches are applied in `patch_model`, after this runs, so what
+    we capture is the unpatched forward either way.
     """
-    base = module._krea2_forward
+    base = getattr(module, "_krea2_forward", None) or module.forward
 
     def forward(x, *args, **kwargs):
         return add_low_rank(base(x, *args, **kwargs), x, l1, l2)
@@ -135,7 +145,9 @@ def collect_svdquant_lora(patcher, lora_sd, strength: float, quant_layers: set[s
             continue
         rank = int(parts["down"].shape[0])
         alpha = parts.get("alpha")
-        mult = strength * (float(alpha) / rank if alpha else 1.0)
+        # `if alpha` would treat a legitimate alpha of 0.0 as "no alpha" and silently run the
+        # layer at full strength instead of disabling it.
+        mult = strength * (float(alpha) / rank if alpha is not None else 1.0)
         l1 = parts["up"].to(device=device, dtype=dtype)
         l2 = parts["down"].to(device=device, dtype=dtype) * mult
         into.setdefault(layer, []).append((l1.contiguous(), l2.contiguous()))
@@ -159,15 +171,29 @@ class Krea2SVDQuantLoraLoader:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "model": ("MODEL", {"tooltip": "Output of the Krea2 SVDQuant W4A4 Loader."}),
-                "lora_name": (folder_paths.get_filename_list("loras"),),
-                "strength": ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.01}),
+                "model": ("MODEL", {
+                    "tooltip": "Output of the Krea2 SVDQuant W4A4 Loader, or any Krea2 "
+                               "checkpoint with convrot_w4a4 quantized blocks.",
+                }),
+                "lora_name": (folder_paths.get_filename_list("loras"), {
+                    "tooltip": "A Krea2 LoRA. Targets 'diffusion_model.blocks.N.{attn,mlp}.*' "
+                               "for the quantized blocks; anything else it carries "
+                               "(txtfusion etc.) goes through ComfyUI's normal path.",
+                }),
+                "strength": ("FLOAT", {
+                    "default": 1.0, "min": -10.0, "max": 10.0, "step": 0.01,
+                    "tooltip": "0 passes the model through untouched. Negative values invert "
+                               "the LoRA. Chain more of these nodes to stack LoRAs - the "
+                               "whole stack is rebuilt each time, so strengths stay exact.",
+                }),
             }
         }
 
     RETURN_TYPES = ("MODEL",)
+    RETURN_NAMES = ("model",)
+    OUTPUT_TOOLTIPS = ("The model with the LoRA attached as a parallel branch.",)
     FUNCTION = "load_lora"
-    CATEGORY = "advanced/loaders"
+    CATEGORY = _CATEGORY
     TITLE = "Krea2 SVDQuant LoRA Loader"
     DESCRIPTION = ("Applies a LoRA to a Krea2 W4A4 quantized model. The standard LoRA "
                    "loader silently skips the quantized layers on these models.")
@@ -184,7 +210,14 @@ class Krea2SVDQuantLoraLoader:
         patcher.krea2_lora_stack = stack
 
         diffusion_model = patcher.model.diffusion_model
-        quant_layers = {name for name, m in diffusion_model.named_modules() if has_branch(m)}
+        # Every convrot_w4a4 layer needs the parallel-branch treatment, whether or not it
+        # already carries an svdq branch. Keying this off `has_branch` instead would come up
+        # empty on a no-low-rank checkpoint, silently route the whole LoRA to ComfyUI's
+        # normal path, and there it cannot patch a QuantizedTensor weight at all -- the exact
+        # failure this node exists to prevent, with no error to show for it.
+        quant_modules = dict(quantized_linears(diffusion_model))
+        quant_layers = set(quant_modules)
+        unbranched = sum(1 for m in quant_modules.values() if not has_branch(m))
 
         # Attach on the offload device and let the forward stage them: matching whatever
         # device the module happens to be on right now would bake in a placement that
@@ -203,7 +236,16 @@ class Krea2SVDQuantLoraLoader:
 
         if quantized == 0 and normal == 0:
             raise ValueError(
-                "no layer of {} matched this model; is it a Krea2 LoRA?".format(lora_name)
+                "no layer of {} matched this model ({} quantized layers were available); "
+                "is it a Krea2 LoRA?".format(lora_name, len(quant_layers))
+            )
+        if quantized == 0 and quant_layers:
+            raise ValueError(
+                "{} matched {} non-quantized layers but none of the {} quantized ones. "
+                "ComfyUI's normal LoRA path cannot patch a quantized weight, so the blocks "
+                "would silently go unchanged. Check that the LoRA targets "
+                "'diffusion_model.blocks.N.{{attn,mlp}}.*'.".format(
+                    lora_name, normal, len(quant_layers))
             )
 
         for layer, factors in collected.items():
@@ -214,8 +256,10 @@ class Krea2SVDQuantLoraLoader:
                 _make_lora_forward(module, l1, l2),
             )
 
-        logging.info("[krea2-svdquant] LoRA stack %s -> %d quantized layers, %d normal layers",
-                     [f"{n}@{a:.2f}" for n, a in stack], quantized, normal)
+        logging.info("[krea2-svdquant] LoRA stack %s -> %d quantized layers, %d normal layers"
+                     "%s", [f"{n}@{a:.2f}" for n, a in stack], quantized, normal,
+                     " (no-low-rank checkpoint: {} quantized layers carry no svdq branch)"
+                     .format(unbranched) if unbranched else "")
         return (patcher,)
 
 

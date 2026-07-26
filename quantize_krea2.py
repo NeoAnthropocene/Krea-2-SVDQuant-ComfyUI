@@ -274,7 +274,15 @@ def conf_tensor(conf: dict) -> torch.Tensor:
 
 
 def convert(src: str, dst: str, fmt: str, groupsize: int, device: str = "cuda", rank: int = 0,
-            refine_iters: int = 100, variant: str = "unknown"):
+            refine_iters: int = 100, variant: str = "unknown", progress_cb=None):
+    """Quantize `src` into `dst`. Returns the summary line it printed.
+
+    `progress_cb(done, total, message)` is called as layers complete, for callers with a
+    progress bar to drive (the ComfyUI node). Errors are `RuntimeError`, never `SystemExit`:
+    `SystemExit` derives from `BaseException`, so raising it from inside a node would slip
+    past ComfyUI's executor instead of being reported as a failed node. `main()` translates
+    them back for the CLI.
+    """
     out: dict[str, torch.Tensor] = {}
     quantized = 0
     kept = 0
@@ -325,6 +333,10 @@ def convert(src: str, dst: str, fmt: str, groupsize: int, device: str = "cuda", 
                     out["{}.comfy_quant".format(layer)] = conf_tensor(conf)
                     del w, qdata, scales
                     quantized += 1
+                    if progress_cb is not None:
+                        progress_cb(quantized, _EXPECTED_LAYERS,
+                                    "quantized {} layers ({:.0f}s)".format(
+                                        quantized, time.time() - t0))
                     if quantized % 32 == 0:
                         torch.cuda.empty_cache()
                         print(f"  [{i + 1}/{len(keys)}] quantized {quantized} layers "
@@ -339,7 +351,7 @@ def convert(src: str, dst: str, fmt: str, groupsize: int, device: str = "cuda", 
     torch.cuda.empty_cache()
 
     if quantized == 0:
-        raise SystemExit(
+        raise RuntimeError(
             "Found the transformer blocks but quantized nothing: no layer under "
             "'{}blocks.' ends in one of the expected leaf names.\n"
             "  expected: {}\n"
@@ -372,10 +384,73 @@ def convert(src: str, dst: str, fmt: str, groupsize: int, device: str = "cuda", 
         "krea2_svdquant_source_name": os.path.basename(src),
         "krea2_svdquant_source_bytes": str(os.path.getsize(src)),
     }
+    if progress_cb is not None:
+        progress_cb(quantized, _EXPECTED_LAYERS, "writing {:.2f} GB ...".format(
+            sum(t.numel() * t.element_size() for t in out.values()) / 1024 ** 3))
     save_file(out, dst, metadata=metadata)
     size = os.path.getsize(dst) / 1024 ** 3
-    print(f"done in {time.time() - t0:.0f}s -> {dst}  ({size:.2f} GB, "
-          f"source {os.path.getsize(src) / 1024 ** 3:.2f} GB)")
+    summary = ("quantized {} layers ({} branched) in {:.0f}s -> {}  ({:.2f} GB, source "
+               "{:.2f} GB)".format(quantized, branched, time.time() - t0, dst, size,
+                                   os.path.getsize(src) / 1024 ** 3))
+    print("done in {:.0f}s -> {}  ({:.2f} GB, source {:.2f} GB)".format(
+        time.time() - t0, dst, size, os.path.getsize(src) / 1024 ** 3))
+    return summary
+
+
+# The Krea 2 block count, used only to scale a progress bar. A variant with a different
+# depth still quantizes correctly; the bar is just less accurate.
+_EXPECTED_LAYERS = 28 * len(_QUANT_SUFFIXES)
+
+_FORMAT_ALIASES = {
+    "int8": "int8_tensorwise",
+    "w4a4": "convrot_w4a4",
+    "svdq": "convrot_w4a4",
+    "fp8": "float8_e4m3fn",
+}
+
+_GENERIC_STEMS = ("raw", "model", "diffusion_pytorch_model", "turbo")
+
+SAMPLER_HINTS = {
+    "base": ("Base (non-distilled) model: start from ~50 steps, cfg 3.5, euler/simple, and a "
+             "real negative prompt. See workflows/krea2_base_svdquant_w4a4_t2i.json."),
+    "turbo": ("Turbo (distilled) model: 8 steps, cfg 1.0, euler/simple. "
+              "See workflows/krea2_turbo_svdquant_w4a4_t2i.json."),
+}
+
+
+def resolve_format(fmt_name: str, rank: int, rank_was_set: bool = True) -> tuple[str, int]:
+    """Map a CLI/node format name to a comfy_kitchen format, validating the rank with it.
+
+    Shared by `main()` and the ComfyUI node so the two cannot drift apart on which
+    combinations are legal.
+    """
+    fmt = _FORMAT_ALIASES[fmt_name]
+    if fmt not in QUANT_ALGOS:
+        raise RuntimeError("{} is not available in this ComfyUI build".format(fmt))
+    # Silently zeroing the rank here used to make `--format w4a4 --rank 128` look like it had
+    # done something it had not.
+    if fmt_name != "svdq" and rank_was_set:
+        raise RuntimeError(
+            "rank only applies to format 'svdq' (you asked for '{}'). The low-rank branch is "
+            "what distinguishes svdq from plain w4a4.".format(fmt_name))
+    if fmt_name == "svdq" and rank <= 0:
+        raise RuntimeError("format 'svdq' needs rank > 0; use format 'w4a4' for no branch")
+    return fmt, (rank if fmt_name == "svdq" else 0)
+
+
+def derive_out_path(src: str, fmt_name: str, rank: int, variant: str) -> tuple[str, str | None]:
+    """The default output path, plus a note to show when the source name is uninformative."""
+    stem = os.path.splitext(os.path.basename(src))[0]
+    note = None
+    if variant != "unknown":
+        stem = "Krea2-{}".format(variant.capitalize())
+    elif stem.lower() in _GENERIC_STEMS:
+        note = ("note: '{}' is a generic filename. Set the variant (or an explicit output "
+                "name) to get a checkpoint name you will still recognise next month."
+                .format(stem))
+    suffix = ("SVDQuant-W4A4-rank{}".format(rank) if rank else
+              ("{}-convrot".format(fmt_name.upper()) if fmt_name != "fp8" else "FP8"))
+    return os.path.join(os.path.dirname(src), "{}-{}.safetensors".format(stem, suffix)), note
 
 
 def main():
@@ -398,44 +473,28 @@ def main():
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
 
-    fmt = {
-        "int8": "int8_tensorwise",
-        "w4a4": "convrot_w4a4",
-        "svdq": "convrot_w4a4",
-        "fp8": "float8_e4m3fn",
-    }[args.format]
-    if fmt not in QUANT_ALGOS:
-        raise SystemExit(f"{fmt} is not available in this ComfyUI build")
-    # Silently zeroing the rank here used to make `--format w4a4 --rank 128` look like it
-    # had done something it had not.
-    if args.format != "svdq" and args.rank != ap.get_default("rank"):
-        raise SystemExit(
-            "--rank only applies to --format svdq (you asked for --format {}). "
-            "The low-rank branch is what distinguishes svdq from plain w4a4."
-            .format(args.format))
-    rank = args.rank if args.format == "svdq" else 0
+    # RuntimeError is the shared failure type (see `convert`); the CLI wants SystemExit so it
+    # prints one clean line instead of a traceback.
+    try:
+        fmt, rank = resolve_format(args.format, args.rank,
+                                   rank_was_set=args.rank != ap.get_default("rank"))
+    except RuntimeError as exc:
+        raise SystemExit(str(exc)) from None
 
     out = args.out
     if out is None:
-        stem = os.path.splitext(os.path.basename(args.src))[0]
-        if args.variant != "unknown":
-            stem = "Krea2-{}".format(args.variant.capitalize())
-        elif stem.lower() in ("raw", "model", "diffusion_pytorch_model", "turbo"):
-            print("note: '{}' is a generic filename. Pass --variant turbo|base (or --out) "
-                  "to get a checkpoint name you will still recognise next month."
-                  .format(stem), flush=True)
-        suffix = f"SVDQuant-W4A4-rank{rank}" if rank else (
-            f"{args.format.upper()}-convrot" if args.format != "fp8" else "FP8")
-        out = os.path.join(os.path.dirname(args.src), f"{stem}-{suffix}.safetensors")
-    convert(args.src, out, fmt, args.groupsize, args.device, rank, args.refine_iters,
-            variant=args.variant)
+        out, note = derive_out_path(args.src, args.format, rank, args.variant)
+        if note:
+            print(note, flush=True)
+    try:
+        convert(args.src, out, fmt, args.groupsize, args.device, rank, args.refine_iters,
+                variant=args.variant)
+    except RuntimeError as exc:
+        raise SystemExit(str(exc)) from None
 
-    if args.variant == "base":
-        print("\nBase (non-distilled) model: start from ~50 steps, cfg 3.5, euler/simple, "
-              "and a real negative prompt. See workflows/krea2_base_svdquant_w4a4_t2i.json.")
-    elif args.variant == "turbo":
-        print("\nTurbo (distilled) model: 8 steps, cfg 1.0, euler/simple. "
-              "See workflows/krea2_svdquant_w4a4_t2i.json.")
+    hint = SAMPLER_HINTS.get(args.variant)
+    if hint:
+        print("\n" + hint)
 
 
 if __name__ == "__main__":

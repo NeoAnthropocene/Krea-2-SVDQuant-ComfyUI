@@ -52,6 +52,11 @@ _DEFAULT_TOKENS = (1024 // 16) * (1024 // 16)
 
 _FUNC = "convrot_w4a4_linear"
 
+# One category for every node in this pack. Under `advanced/loaders` they were scattered
+# among ComfyUI's own dozen-plus loaders; class names are what saved workflows match on, so
+# moving them here does not break existing graphs.
+_CATEGORY = "Krea2/SVDQuant"
+
 
 def _is_convrot_w4a4(weight) -> bool:
     """True for a QuantizedTensor carrying this repo's convrot_w4a4 layout."""
@@ -163,25 +168,67 @@ def dispatch_warning(backend: str | None, failures: dict) -> str | None:
     return "\n".join(lines)
 
 
-def log_dispatch(diffusion_model) -> None:
-    """One line on every load, plus a loud block when the fast kernel is not available."""
+def log_dispatch(diffusion_model) -> str:
+    """One line on every load, plus a loud block when the fast kernel is not available.
+
+    Returns the same text it logs so the loader node can show it in the UI; returns an empty
+    string when there is nothing to say.
+    """
     try:
         first = next(iter(quantized_linears(diffusion_model)), None)
         if first is None:
-            return
+            return ""
         backend, impl_path, failures = resolve_dispatch(first[1])
         if backend is None:
             logging.warning("[krea2-svdquant] could not resolve a convrot_w4a4 backend: %s",
                             failures)
-            return
+            return "could not resolve a convrot_w4a4 backend: {}".format(failures)
         logging.info("[krea2-svdquant] convrot_w4a4 dispatch backend: %s (%s)",
                      backend, impl_path)
         warning = dispatch_warning(backend, failures)
         if warning:
             logging.warning("%s", warning)
+        return "\n".join(x for x in (
+            "convrot_w4a4 dispatch backend: {} ({})".format(backend, impl_path), warning) if x)
     except Exception:
         # A diagnostic must never be the reason a model fails to load.
         logging.debug("[krea2-svdquant] dispatch probe failed", exc_info=True)
+        return ""
+
+
+def report_backend_status() -> str:
+    """The part of the dispatch story that needs no model loaded.
+
+    Answers "is the int4 tensor-core kernel even available on this install?" -- worth being
+    able to ask *before* downloading an 8 GB checkpoint, which is why both `diagnose.py
+    --no-load` and the env-check node come through here.
+    """
+    lines = ["torch {}  (cuda build {})".format(torch.__version__, torch.version.cuda), ""]
+    if ck_registry is None:
+        lines.append("comfy_kitchen unavailable: {}".format(_CK_IMPORT_ERROR))
+        return "\n".join(lines)
+
+    for name, info in sorted(ck_registry.list_backends().items()):
+        lines.append("{:<8} available={:<5} disabled={:<5} implements {}={:<5} reason={}".format(
+            name, str(info["available"]), str(info["disabled"]), _FUNC,
+            str(_FUNC in info["capabilities"]), info["unavailable_reason"] or "-"))
+
+    active = [n for n, i in ck_registry.list_backends().items()
+              if i["available"] and not i["disabled"] and _FUNC in i["capabilities"]]
+    lines.append("")
+    if "cuda" in active:
+        lines.append("cuda backend is live -- the int4 tensor-core kernel is available.")
+    else:
+        lines.append(
+            "cuda backend is NOT live. convrot_w4a4 will fall back to {}, which unpacks "
+            "int4 to bf16 in Python -- expect this checkpoint to be slower than fp8."
+            .format(active or "nothing"))
+        cuda_build = torch.version.cuda
+        if cuda_build is None or int(str(cuda_build).split(".")[0]) < 13:
+            lines.append(
+                "ComfyUI disables comfy_kitchen's CUDA backend on torch built against "
+                "CUDA < 13 (comfy/quant_ops.py). Install a cu130 or newer torch build.")
+    return "\n".join(lines)
 
 
 # --------------------------------------------------------------------------- reports
@@ -460,9 +507,11 @@ class Krea2SVDQuantDiagnostics:
 
     RETURN_TYPES = ("MODEL", "STRING")
     RETURN_NAMES = ("model", "report")
+    OUTPUT_TOOLTIPS = ("The model, unchanged - wire it on to your sampler.",
+                       "The report as text, for pasting into a bug report.")
     OUTPUT_NODE = True
     FUNCTION = "run"
-    CATEGORY = "advanced/loaders"
+    CATEGORY = _CATEGORY
     TITLE = "Krea2 SVDQuant Diagnostics"
     DESCRIPTION = ("Passthrough node that reports which comfy_kitchen backend the "
                    "quantized layers dispatch to, plus memory accounting and timings. "
@@ -478,5 +527,47 @@ class Krea2SVDQuantDiagnostics:
         return {"ui": {"text": [report]}, "result": (model, report)}
 
 
-NODE_CLASS_MAPPINGS = {"Krea2SVDQuantDiagnostics": Krea2SVDQuantDiagnostics}
-NODE_DISPLAY_NAME_MAPPINGS = {"Krea2SVDQuantDiagnostics": "Krea2 SVDQuant Diagnostics"}
+class Krea2SVDQuantEnvCheck:
+    """Backend status with no model wired in.
+
+    The single most common report against this pack is "the quantized checkpoint is slower
+    than fp8", and the answer is almost always that ComfyUI disabled comfy_kitchen's CUDA
+    backend because torch was built against CUDA < 13. That is answerable without loading
+    anything, so it should be answerable before an 8 GB download rather than after.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {}}
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        # Backend availability is process state, not graph state, so never serve a cached
+        # result -- the whole point is to report what is true right now.
+        return float("nan")
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("report",)
+    OUTPUT_TOOLTIPS = ("Backend status as text, for pasting into a bug report.",)
+    OUTPUT_NODE = True
+    FUNCTION = "run"
+    CATEGORY = _CATEGORY
+    TITLE = "Krea2 SVDQuant Env Check"
+    DESCRIPTION = ("Is the int4 tensor-core kernel available on this install? Needs no model "
+                   "and no checkpoint - run it before downloading one. If it says the cuda "
+                   "backend is not live, quantized checkpoints will be slower than fp8.")
+
+    def run(self):
+        try:
+            report = report_backend_status()
+        except Exception as exc:
+            logging.exception("[krea2-svdquant] env check failed")
+            report = "env check failed: {}: {}".format(type(exc).__name__, exc)
+        logging.info("\n%s", report)
+        return {"ui": {"text": [report]}, "result": (report,)}
+
+
+NODE_CLASS_MAPPINGS = {"Krea2SVDQuantDiagnostics": Krea2SVDQuantDiagnostics,
+                       "Krea2SVDQuantEnvCheck": Krea2SVDQuantEnvCheck}
+NODE_DISPLAY_NAME_MAPPINGS = {"Krea2SVDQuantDiagnostics": "Krea2 SVDQuant Diagnostics",
+                              "Krea2SVDQuantEnvCheck": "Krea2 SVDQuant Env Check"}

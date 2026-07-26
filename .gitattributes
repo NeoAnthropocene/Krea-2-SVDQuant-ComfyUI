@@ -1,0 +1,5 @@
+# tools/build_workflows.py writes LF. Without this, git's autocrlf turns every regeneration
+# into a whole-file diff on Windows.
+*.json text eol=lf
+*.py text eol=lf
+*.md text eol=lf

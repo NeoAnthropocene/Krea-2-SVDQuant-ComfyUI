@@ -23,7 +23,7 @@ import comfy.sd
 import comfy.utils
 import folder_paths
 
-from .svdquant_diag import log_dispatch
+from .svdquant_diag import _CATEGORY, log_dispatch
 
 _L1 = ".svdq_l1"
 _L2 = ".svdq_l2"
@@ -152,9 +152,21 @@ def attach_branch(module: torch.nn.Module, l1: torch.Tensor, l2: torch.Tensor,
 
 
 def _get_submodule(root: torch.nn.Module, dotted: str) -> torch.nn.Module:
+    """Walk a dotted path, reporting the layer name rather than the raw attribute error.
+
+    Left to `getattr`/`__getitem__` this surfaces as a bare ``AttributeError: 'ModuleList'
+    object has no attribute 'nope'`` or ``IndexError: index 999 is out of range``, which says
+    nothing about which checkpoint key failed to map.
+    """
     module = root
-    for p in dotted.split("."):
-        module = module[int(p)] if p.isdigit() else getattr(module, p)
+    for i, p in enumerate(dotted.split(".")):
+        try:
+            module = module[int(p)] if p.isdigit() else getattr(module, p)
+        except (AttributeError, IndexError, KeyError) as exc:
+            raise RuntimeError(
+                "checkpoint refers to layer {!r}, which this model does not have "
+                "(failed at {!r}): {}".format(dotted, ".".join(dotted.split(".")[:i + 1]), exc)
+            ) from exc
     return module
 
 
@@ -174,8 +186,12 @@ def _shield_from_dynamo(module: torch.nn.Module) -> None:
     """
     try:
         module.forward = torch._dynamo.disable(module.forward)
-    except Exception:
-        pass
+    except Exception as exc:
+        # Not fatal on its own -- the model runs fine uncompiled. But if this silently
+        # no-ops, a later TorchCompileModel dies inside the comfy_kitchen kernel with a
+        # fake-tensor error that points nowhere near here, so leave a trail.
+        logging.debug("[krea2-svdquant] could not shield %s from dynamo: %s",
+                      type(module).__name__, exc)
 
 
 def load_svdquant_w4a4(path: str, model_options: dict | None = None,
@@ -209,32 +225,62 @@ def load_svdquant_w4a4(path: str, model_options: dict | None = None,
 
     diffusion_model = patcher.model.diffusion_model
     attached = 0
-    rank = 0
+    ranks: set[int] = set()
+    incomplete = []
     for layer, parts in branches.items():
         if "l1" not in parts or "l2" not in parts:
+            incomplete.append(layer)
             continue
         submodule_path = layer[len(layer_prefix):] if layer_prefix else layer
         base = _get_submodule(diffusion_model, submodule_path)
         if compile_safe:
             _shield_from_dynamo(base)
         attach_branch(base, parts["l1"], parts["l2"])
-        rank = rank or int(parts["l1"].shape[1])
+        # Collected per layer rather than read once off the first branch, so a checkpoint
+        # with a non-uniform rank budget reports honestly instead of quoting layer zero.
+        ranks.add(int(parts["l1"].shape[1]))
         attached += 1
+
+    # Silently returning a patcher with no branches would hand back a plain quantized model
+    # dressed as an SVDQuant one -- same class of failure quantize_krea2.py hard-fails on.
+    if attached == 0:
+        raise RuntimeError(
+            "{}: found {} svdq_l1/svdq_l2 key pairs but attached none of them"
+            "{}. The checkpoint's layer names do not line up with this model "
+            "(detected prefix {!r}).".format(
+                path, len(branches),
+                "; {} were missing their other half".format(len(incomplete))
+                if incomplete else "",
+                layer_prefix)
+        )
 
     # The branch buffers were registered after the patcher computed (and cached) its size,
     # so drop the cache and let `model_size()` re-derive it from the state dict.
     patcher.size = 0
 
     # Metadata is a newer addition; checkpoints published before it still load, with the
-    # rank recovered from the factor shape exactly as before.
+    # rank recovered from the factor shape exactly as before. The shapes are the ground
+    # truth, so they win over a metadata value that disagrees with them.
     meta = metadata or {}
-    rank = int(meta.get("krea2_svdquant_rank") or rank)
+    rank_desc = (str(next(iter(ranks))) if len(ranks) == 1
+                 else "{}-{} mixed".format(min(ranks), max(ranks)))
+    meta_rank = meta.get("krea2_svdquant_rank")
+    if meta_rank and len(ranks) == 1 and int(meta_rank) != next(iter(ranks)):
+        logging.warning("[krea2-svdquant] metadata says rank %s but the factors are rank %s; "
+                        "trusting the factors", meta_rank, rank_desc)
     variant = meta.get("krea2_svdquant_variant", "unknown")
-    logging.info("[krea2-svdquant] w4a4 + low-rank: attached %d branches (rank %d, "
-                 "variant %s), model_size %.2f GiB",
-                 attached, rank, variant, patcher.model_size() / 1024 ** 3)
+    summary = ("w4a4 + low-rank: attached {} branches (rank {}, variant {}), "
+               "model_size {:.2f} GiB".format(
+                   attached, rank_desc, variant, patcher.model_size() / 1024 ** 3))
+    logging.info("[krea2-svdquant] %s", summary)
 
-    log_dispatch(diffusion_model)
+    dispatch = log_dispatch(diffusion_model)
+
+    # Stashed rather than returned so callers that just want the model (diagnose.py, the
+    # head-to-head scripts) keep working unchanged. The node surfaces it in the UI, which
+    # matters most for the dispatch warning: buried in the console, the people who most need
+    # to read it are exactly the ones who never see it.
+    patcher.krea2_load_summary = "\n".join(x for x in (summary, dispatch) if x)
     return patcher
 
 
@@ -244,21 +290,32 @@ class Krea2SVDQuantW4A4Loader:
         return {
             "required": {
                 "model_name": (folder_paths.get_filename_list("diffusion_models"), {
-                    "tooltip": "A checkpoint produced by quantize_krea2.py --format svdq"
+                    "tooltip": "A checkpoint from quantize_krea2.py --format svdq (it carries "
+                               "*.svdq_l1/*.svdq_l2 tensors). The --format w4a4 / int8 / fp8 "
+                               "checkpoints have no branch and load with the stock UNETLoader "
+                               "instead.",
                 }),
             }
         }
 
-    RETURN_TYPES = ("MODEL",)
+    RETURN_TYPES = ("MODEL", "STRING")
+    RETURN_NAMES = ("model", "status")
+    OUTPUT_TOOLTIPS = ("Wire this to a KSampler.",
+                       "Rank, variant, size and which kernel the quantized layers will "
+                       "actually dispatch to. Read this if generation is slow.")
+    OUTPUT_NODE = True
     FUNCTION = "load"
-    CATEGORY = "advanced/loaders"
+    CATEGORY = _CATEGORY
     TITLE = "Krea2 SVDQuant W4A4 Loader"
     DESCRIPTION = ("Loads a W4A4 + low-rank (SVDQuant) Krea2 checkpoint. Self-contained: "
-                   "no separate base model needed.")
+                   "no separate base model needed. The status output tells you whether the "
+                   "fast int4 kernel is in play.")
 
     def load(self, model_name):
         path = folder_paths.get_full_path_or_raise("diffusion_models", model_name)
-        return (load_svdquant_w4a4(path),)
+        patcher = load_svdquant_w4a4(path)
+        status = getattr(patcher, "krea2_load_summary", "")
+        return {"ui": {"text": [status]}, "result": (patcher, status)}
 
 
 NODE_CLASS_MAPPINGS = {"Krea2SVDQuantW4A4Loader": Krea2SVDQuantW4A4Loader}
