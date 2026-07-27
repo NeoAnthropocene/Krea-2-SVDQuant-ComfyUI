@@ -168,6 +168,51 @@ def dispatch_warning(backend: str | None, failures: dict) -> str | None:
     return "\n".join(lines)
 
 
+def _capability(device=None) -> tuple[int, int] | None:
+    """(major, minor) compute capability of the device we would sample on, or None."""
+    if not torch.cuda.is_available():
+        return None
+    try:
+        return torch.cuda.get_device_capability(device or mm.get_torch_device())
+    except Exception:
+        return None
+
+
+def architecture_note(device=None) -> str | None:
+    """The speed caveat that applies even when the cuda backend *is* live.
+
+    Turing (SM 7.5) is the case that generates support traffic. The backend validates, the
+    kernel runs, nothing looks wrong -- and the checkpoint is barely faster than int8, so
+    people conclude their install is broken and spend an evening trying to compile
+    comfy_kitchen by hand. It is not broken and compiling changes nothing:
+
+    * The int4 tensor-core instruction the Ampere+ path is built around (`mma.m16n8k64`,
+      s4*s4->s32) does not exist on SM 7.5. comfy_kitchen's default convrot path targets
+      Sm89 and gates that instruction behind `__CUDA_ARCH__ >= 800`.
+    * SM 7.5 is served instead by separate kernels (`turing_int4.cu`, `turing_int8.cu`)
+      built on a smaller MMA instruction tile -- `GemmShape<8, 8, 32>` against the default
+      int8 path's `GemmShape<16, 8, 32>` -- and without `cp.async` prefetch, which is also
+      SM80+. Both formats lose, so switching to int8 does not dodge it either.
+
+    We have no Turing hardware to measure on, so this says "expect little or no speedup"
+    rather than quoting a ratio; community reports on 2060/2070/2080 Ti are consistent with
+    roughly parity against int8. The value here is telling someone their setup is fine.
+    """
+    cap = _capability(device)
+    if cap is None or cap[0] != 7:
+        return None
+    return (
+        "[krea2-svdquant] NOTE: this GPU is compute capability {}.{} (Turing). The int4 MMA "
+        "instruction the fast path is built around (mma.m16n8k64) is Ampere and newer, so "
+        "comfy_kitchen falls back to its separate SM75 kernels, which use a smaller "
+        "instruction tile and no cp.async prefetch.\n"
+        "  Expect little or no speedup from int4 over int8 on this card. That is a hardware "
+        "and upstream-kernel limitation, not a misconfiguration -- rebuilding comfy_kitchen "
+        "will not change it. The int4 checkpoint is still worth it for the smaller VRAM "
+        "footprint.".format(cap[0], cap[1])
+    )
+
+
 def log_dispatch(diffusion_model) -> str:
     """One line on every load, plus a loud block when the fast kernel is not available.
 
@@ -188,8 +233,14 @@ def log_dispatch(diffusion_model) -> str:
         warning = dispatch_warning(backend, failures)
         if warning:
             logging.warning("%s", warning)
+        # Reported even when the backend is 'cuda': on Turing the kernel is live and still
+        # slow, which is exactly the case `dispatch_warning` stays silent about.
+        arch = architecture_note()
+        if arch:
+            logging.warning("%s", arch)
         return "\n".join(x for x in (
-            "convrot_w4a4 dispatch backend: {} ({})".format(backend, impl_path), warning) if x)
+            "convrot_w4a4 dispatch backend: {} ({})".format(backend, impl_path),
+            warning, arch) if x)
     except Exception:
         # A diagnostic must never be the reason a model fails to load.
         logging.debug("[krea2-svdquant] dispatch probe failed", exc_info=True)
@@ -218,6 +269,12 @@ def report_backend_status() -> str:
     lines.append("")
     if "cuda" in active:
         lines.append("cuda backend is live -- the int4 tensor-core kernel is available.")
+        # "Available" is not "fast" on pre-Ampere, and this report is the one people read
+        # before downloading 8 GB.
+        arch = architecture_note()
+        if arch:
+            lines.append("")
+            lines.append(arch)
     else:
         lines.append(
             "cuda backend is NOT live. convrot_w4a4 will fall back to {}, which unpacks "

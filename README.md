@@ -103,12 +103,20 @@ The no-low-rank file loads with the stock ComfyUI **UNETLoader**. The three `svd
 checkpoints need the **Krea2 SVDQuant W4A4 Loader** node from this repo (they carry extra
 `*.svdq_l1` / `*.svdq_l2` tensors the stock loader doesn't know about).
 
-Higher rank = larger low-rank correction branch = closer to the unquantized model. All three
-are built with `refine_iters=100`, which is what makes that true — see
-the rank/refine section under [Quantize your own
-checkpoint](#quantize-your-own-checkpoint). Branch
-reconstruction error over four sampled layers: 0.127 at rank 16, 0.098 at rank 64, 0.080 at
-rank 128.
+Higher rank = larger low-rank correction branch = lower weight reconstruction error. Over
+four sampled layers: 0.127 at rank 16, 0.098 at rank 64, 0.080 at rank 128. All are built
+with `refine_iters=100`, which is what makes rank worth spending at all.
+
+**Which one to download.** Lower reconstruction error stops translating into visibly closer
+*images* past rank 64 — unless you load a LoRA, and then it keeps paying up to 256. Measured
+paired over 16 prompts x 2 seeds; details and the numbers are in
+[BENCHMARKS.md](BENCHMARKS.md#test-3--paired-lpips-fidelity-with-and-without-a-lora).
+
+| you | pick |
+|---|---|
+| never use LoRAs | **rank 64** — 128 and 256 measure the same, so the extra GB is wasted |
+| use LoRAs | **rank 256** — rank 64 loses most of its advantage under one |
+| want the smallest/fastest and can accept the drop | no-low-rank, or rank 16 |
 
 Each file records how it was built in its safetensors metadata (`krea2_svdquant_rank`,
 `krea2_svdquant_refine_iters`, tool version, source file), so you can check what you
@@ -185,16 +193,40 @@ queue. Three things to know before you do:
   reload.
 - **It writes ~8 GB**, and refuses rather than overwriting unless you tick `overwrite`.
 
-**`rank` and `refine_iters` are one lever, not two.** Measured with LPIPS against a BF16
-reference over 10 prompts: with refinement on, LPIPS falls monotonically with rank across all
-five ranks tested (16 → 256), and higher rank helps in **10 of 10** prompts individually. With
-refinement off, the same sweep is flat — rank 16 and rank 256 land within noise of each other
-(0.337 vs 0.340), so the extra 1.5 GB buys nothing. Each doubling of rank buys about 0.013
-LPIPS when refining, against a reseed distance of 0.531.
+**`rank` and `refine_iters` are one lever, not two.** With refinement off, a rank sweep is
+flat — rank 16 and rank 256 land within noise of each other (0.337 vs 0.340), so the extra
+1.5 GB buys nothing. Raising rank without `refine_iters > 0` is wasted file size; if you want
+the cheap build, lower the rank rather than skipping refinement.
 
-So: raising rank without `refine_iters > 0` is wasted file size. If you want the cheap build,
-lower the rank rather than skipping refinement. Full numbers in
-[accuracy](#accuracy-vs-the-base-model-qualitatively).
+**How much rank you need depends on whether you load a LoRA.** Measured paired over 16 prompts
+x 2 seeds, refinement on ([BENCHMARKS.md](BENCHMARKS.md#test-3--paired-lpips-fidelity-with-and-without-a-lora)):
+
+| | no LoRA | with a LoRA |
+|---|---|---|
+| best rank | 64 (128 and 256 tie with it) | **256** |
+| r256 vs r64 | t=0.39, wins 16/32 — a coin flip | t=2.8-3.5, wins 23-26/32 |
+| r64 vs no branch at all | t=4.45, clearly better | t=0.73-1.72, barely better |
+
+So a rank-64 branch saturates on plain t2i and then largely stops earning its keep once a
+LoRA is loaded on top, while rank 256 holds its advantage in both cases. **Rank 256 if you
+use LoRAs, rank 64 if you never do.**
+
+<details>
+<summary>An earlier version of this section claimed LPIPS falls monotonically with rank — that was wrong</summary>
+
+It read: *"with refinement on, LPIPS falls monotonically with rank across all five ranks
+tested (16 → 256), and higher rank helps in 10 of 10 prompts individually."*
+
+That came from 10 prompts at a **single seed**, compared as marginal per-checkpoint means,
+and using `wan21-vae` rather than this repo's own `qwen_image_vae`. Re-measured properly —
+paired differences, two seeds, 16 prompts, correct VAE — rank 64, 128 and 256 are statistically
+indistinguishable without a LoRA (`r128 vs r64` t=0.01 at 16/32). Monotonicity was an artifact
+of the weaker measurement, not a property of the checkpoints.
+
+Kept visible rather than quietly deleted: the mistake is the same one the `--rank-alloc`
+section below documents, and the fix in both cases was a better statistic, not more data.
+
+</details>
 
 ### `--rank-alloc`: where the rank goes, and why it doesn't matter
 
@@ -429,6 +461,31 @@ python -c "import torch; print(torch.__version__, torch.version.cuda)"
 
 If that prints anything below `13.0`, install a cu130+ torch build. The loader now prints
 the resolved backend on every load and shouts if it isn't `cuda`.
+
+### "No speedup at all on my RTX 20-series" (Turing)
+
+Different problem, and this one has no fix on our side. The backend resolves to `cuda`, the
+kernel runs, nothing is misconfigured — int4 is simply not much faster than int8 on Turing:
+
+- The instruction the fast path is built around, `mma.m16n8k64` (s4×s4→s32), is **Ampere and
+  newer**. `comfy_kitchen`'s default convrot path targets `Sm89` and gates that instruction
+  behind `__CUDA_ARCH__ >= 800`.
+- SM 7.5 is served by separate kernels (`turing_int4.cu`, `turing_int8.cu`) built on a
+  smaller MMA tile — `GemmShape<8, 8, 32>` versus the default int8 path's
+  `GemmShape<16, 8, 32>` — and without `cp.async` prefetch, which is also SM80+.
+
+Both formats run weaker kernels there, so switching to int8 does not dodge it either.
+Rebuilding `comfy_kitchen` yourself will not change it: the SM75 kernels are what you get.
+
+The int4 checkpoint is still worth downloading on these cards for the **smaller VRAM
+footprint** — just do not expect the speed column of the benchmark table.
+
+The diagnostics node and `diagnose.py --no-load` now say this explicitly when they detect a
+compute-capability-7.x device, so you can tell "my setup is broken" apart from "my card
+predates the instruction". Those kernels live in
+[comfy-kitchen](https://github.com/Comfy-Org/comfy-kitchen), not here — this repo ships no
+CUDA build pipeline, and we have no Turing hardware to validate a replacement against, so
+the honest answer is to report it upstream rather than have us ship an untested kernel.
 
 ### "Pin error." in the console
 
