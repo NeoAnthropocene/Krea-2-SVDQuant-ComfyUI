@@ -90,22 +90,65 @@ with safe_open("Krea2-Turbo-SVDQuant-W4A4-rank256-actaware.safetensors", framewo
 
 ## See it
 
-Full comparison sheets — 16 prompts x 7 checkpoints x 2 seeds, with and without a LoRA — are
-in **[GALLERY.md](GALLERY.md)**. Three of them here. Columns run BF16 reference, no branch,
-then rising rank, ending with the activation-aware build; the two rows are two seeds, so
-anything that changes between rows is sampling variance rather than the checkpoint.
+Six of the sixteen benchmark prompts, each rendered by all seven checkpoints at two seeds.
+The other ten, and the whole set again with a LoRA loaded, are in
+**[GALLERY.md](GALLERY.md)**.
 
-Dense small text, the hardest case in the set:
+Columns run left to right in accuracy order: **BF16 reference** first, then no low-rank
+branch, then rising rank, ending with the activation-aware build. Rows are two seeds. So
+anything that differs between the two rows of a *single* column is sampling variance, not a
+property of the checkpoint -- and if a difference between columns is smaller than the
+difference between rows, it is not a difference.
 
-![01_dense_text](examples/fidelity_sheets/sheet_base_01_dense_text.jpg)
+Settings never change: 1024x1024, 8 steps, cfg 1.0, euler/simple, seeds 987654321 and 424242424.
 
-A portrait — skin texture and catchlights, where quantization is most visible to a viewer:
+### 01_dense_text
 
-![11_portrait_woman](examples/fidelity_sheets/sheet_base_11_portrait_woman.jpg)
+> A rain-soaked neon diner sign at night, below it a handwritten chalkboard menu with three lines of text reading 'SOUP $4 / PIE $6 / COFFEE $2', reflections on wet asphalt, cinematic
 
-The same portrait prompt with a realism LoRA loaded on top, BF16 column included:
+Three lines of small chalkboard text. The hardest cell in the set: read the prices.
 
-![11_portrait_woman_lora](examples/fidelity_sheets/sheet_lora2_11_portrait_woman.jpg)
+![base_01_dense_text](examples/fidelity_sheets/sheet_base_01_dense_text.jpg)
+
+### 09_counting_objects
+
+> A wooden table from directly above with exactly seven red apples arranged in a neat row next to three green pears, soft natural light, flat lay photography
+
+Seven apples, three pears. Miscounting is a structural failure, not a detail one.
+
+![base_09_counting_objects](examples/fidelity_sheets/sheet_base_09_counting_objects.jpg)
+
+### 11_portrait_woman
+
+> Close-up portrait of a woman with freckles and green eyes, windswept auburn hair, wearing a chunky knitted wool sweater, standing on a rainy city street at blue hour, shallow depth of field, natural skin texture with visible pores, catchlights in both eyes, 85mm lens, photorealistic
+
+Skin texture, freckles, catchlights. Where a photographic LoRA earns its keep.
+
+![base_11_portrait_woman](examples/fidelity_sheets/sheet_base_11_portrait_woman.jpg)
+
+### 12_person_holding_sign
+
+> A young woman in a bright yellow raincoat standing at the end of a wooden pier, holding up a handwritten cardboard sign that reads 'BACK IN 5 MIN' in thick black marker, seagulls circling behind her, overcast diffused light, full body shot, 35mm documentary photography
+
+Handwritten marker text on cardboard at arm's length -- text plus a full body.
+
+![base_12_person_holding_sign](examples/fidelity_sheets/sheet_base_12_person_holding_sign.jpg)
+
+### 05_symmetry_pattern
+
+> A perfectly symmetrical Islamic geometric tile mosaic, intricate repeating star and polygon pattern, deep blue and gold, overhead flat lighting, ultra sharp
+
+Repeating geometry. Breaks in the tiling are far easier to see than colour drift.
+
+![base_05_symmetry_pattern](examples/fidelity_sheets/sheet_base_05_symmetry_pattern.jpg)
+
+### 11_portrait_woman, with a realism LoRA on top
+
+> Close-up portrait of a woman with freckles and green eyes, windswept auburn hair, wearing a chunky knitted wool sweater, standing on a rainy city street at blue hour, shallow depth of field, natural skin texture with visible pores, catchlights in both eyes, 85mm lens, photorealistic
+
+The same prompt and seeds with `bloomgirls-ultrarealism` at strength 1.0. The BF16 column carries the LoRA too, so this compares quantized+LoRA against BF16+LoRA.
+
+![lora2_11_portrait_woman](examples/fidelity_sheets/sheet_lora2_11_portrait_woman.jpg)
 
 ## Why this exists
 
@@ -265,19 +308,53 @@ one that worked, and it optimises against something else.
 ## What was measured
 
 Full tables, methodology and caveats: **[BENCHMARKS.md](BENCHMARKS.md)**. Images:
-**[GALLERY.md](GALLERY.md)**. In short, on an RTX 3090 at 1024x1024 / 8 steps / cfg 1.0:
+**[GALLERY.md](GALLERY.md)**. All of this on an RTX 3090 at 1024x1024 / 8 steps / cfg 1.0.
 
-* **Speed.** W4A4 with no branch is ~2.9x BF16; the low-rank branch costs ~9-10% of step time
-  and barely varies with rank, so rank 256 is only ~4% slower than rank 16. FP8 is *slower*
-  than BF16 on Ampere. INT8 is the fastest accurate option.
-* **Fidelity.** Every claim comes from `tools/fidelity_bench.py`: 16 prompts x 2 seeds x 5 LoRA
-  arms, LPIPS against a BF16 reference generated in the *same* arm, compared as paired
-  differences with a reseed noise floor printed beside every result. Two findings:
-  **branch rank only matters under a LoRA**, and **the activation-aware objective beats every
-  other checkpoint here without one**.
-* **What was withdrawn.** An earlier quality ranking came from an LLM judge that had
-  saturated (9 of 12 rows a flat 10.00/10) and a rank claim came from one seed compared as
-  marginal means. Both are struck through in place with the reason, rather than deleted.
+**Speed**, warm (model already resident), 10 prompts:
+
+| checkpoint | warm | vs BF16 |
+|---|---|---|
+| BF16 (reference) | 18.80 s | 1.00x |
+| W4A4, no low-rank branch | 6.49 s | **2.90x** |
+| SVDQuant rank 64 | 7.16 s | 2.63x |
+| SVDQuant rank 256 | 7.77 s | 2.42x |
+
+`-actaware` is absent from that table because it cannot differ: same tensor shapes, same
+format, same kernels, only different numbers inside the branch. The branch costs ~9-10% of step
+time and barely varies with rank — rank 256 is only ~4% slower than rank 16, so rank is a size
+and fidelity decision, not a speed one. FP8 is *slower* than
+BF16 on Ampere (no FP8 tensor cores); INT8 is the fastest accurate option.
+
+**Fidelity**, LPIPS against a BF16 reference over 16 prompts x 2 seeds (lower is closer):
+
+| checkpoint | no LoRA | with `canon` | with `bloomgirls` |
+|---|---|---|---|
+| W4A4, no low-rank branch | 0.3954 | 0.3944 | 0.3808 |
+| SVDQuant rank 16 | 0.3758 | 0.3453 | 0.3672 |
+| SVDQuant rank 64 | 0.3325 | 0.3611 | 0.3684 |
+| SVDQuant rank 256 | 0.3378 | **0.2993** | 0.3215 |
+| SVDQuant rank 256, actaware | **0.2825** | 0.3213 | **0.3097** |
+
+Each column is scored against its *own* BF16 reference — a LoRA changes how seed-sensitive the
+model is, so the reseed floor differs per column (0.547 / 0.519 / 0.551) and the numbers are
+**not comparable across columns**, only down them.
+Two findings come out of that table, both from paired differences over shared prompt+seed
+cells rather than the marginal means above (`|t| > 3` is the bar this repo treats as claimable):
+
+| comparison | no LoRA | with a LoRA |
+|---|---|---|
+| rank 256 vs rank 64 | t=0.39, wins 16/32 — a coin flip | t=2.8-3.5, wins 23-26/32 |
+| rank 64 vs no branch at all | t=4.45, clearly better | t=0.73-1.72, barely better |
+| actaware vs plain rank 256 | **t=4.68**, wins 27/32 | t=0.7-1.7, no effect either way |
+
+So: **branch rank only matters under a LoRA**, and **the activation-aware objective is the
+biggest single gain here** — which is why the download table starts with it.
+
+Every fidelity number comes from `tools/fidelity_bench.py` (16 prompts x 2 seeds x 5 LoRA
+arms), and it exists because the repo's earlier quality ranking could not be defended: it came
+from an LLM judge that had saturated, 9 of 12 rows a flat 10.00/10, and a rank claim built on
+one seed compared as marginal means. Both are struck through in place with the reason rather
+than deleted.
 
 ## LoRA
 

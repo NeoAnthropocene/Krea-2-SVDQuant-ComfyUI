@@ -13,11 +13,14 @@ small one and mangle a line of text.
 * [Single-prompt stress tests](#single-prompt-stress-tests)
 
 **How to read the sheets.** They are wide -- open one full size, they are unreadable at page
-width. Columns run left to right in accuracy order: **BF16 reference** first, then no
-low-rank branch, then rising rank, ending with the activation-aware build. Rows are two
-seeds. So anything that differs between the two rows of a *single* column is sampling
-variance, not a property of the checkpoint -- and if a difference between columns is smaller
-than the difference between rows, it is not a difference.
+width. Columns run left to right in accuracy order: **BF16 reference** first, then no low-rank
+branch, then rising rank, ending with the activation-aware build. Rows are two seeds. So
+anything that differs between the two rows of a *single* column is sampling variance, not a
+property of the checkpoint -- and if a difference between columns is smaller than the
+difference between rows, it is not a difference.
+
+Settings are identical everywhere: 1024x1024, 8 steps, cfg 1.0, euler/simple, `qwen_image_vae`,
+seeds 987654321 and 424242424.
 
 
 ## Fidelity sheets, no LoRA
@@ -25,67 +28,131 @@ than the difference between rows, it is not a difference.
 Built with `tools/contact_sheet.py` from the same renders `tools/fidelity_bench.py score` measures, so every image here has a number behind it in
 [Test 3 and Test 4](BENCHMARKS.md#test-3--paired-lpips-fidelity-with-and-without-a-lora).
 
-**01_dense_text** -- Three lines of small chalkboard text. The hardest cell in the set: read the prices.
+### 01_dense_text
+
+> A rain-soaked neon diner sign at night, below it a handwritten chalkboard menu with three lines of text reading 'SOUP $4 / PIE $6 / COFFEE $2', reflections on wet asphalt, cinematic
+
+Three lines of small chalkboard text. The hardest cell in the set: read the prices.
 
 ![01_dense_text](examples/fidelity_sheets/sheet_base_01_dense_text.jpg)
 
-**02_curved_text** -- Two large words wrapped around a cup. Every checkpoint gets this; it is the easy control.
+### 02_curved_text
+
+> Close-up of a person holding a paper coffee cup with large bold curved text 'STAY WARM' printed around the cup, soft morning light, shallow depth of field
+
+Two large words wrapped around a cup. Every checkpoint gets this; it is the easy control.
 
 ![02_curved_text](examples/fidelity_sheets/sheet_base_02_curved_text.jpg)
 
-**03_hands_detail** -- Finger placement on the strings, and whether the motion-blurred bow holds together.
+### 03_hands_detail
+
+> A violinist's hands mid-performance, fingers pressed on the strings, bow in motion with visible blur, studio lighting, extreme close-up, photorealistic
+
+Finger placement on the strings, and whether the motion-blurred bow holds together.
 
 ![03_hands_detail](examples/fidelity_sheets/sheet_base_03_hands_detail.jpg)
 
-**04_crowd_faces** -- Dozens of small faces. Look for melted or duplicated ones rather than at the whole frame.
+### 04_crowd_faces
+
+> A busy Tokyo street crossing at dusk, dozens of pedestrians with distinct faces and expressions, neon signage in the background, wide angle, high detail
+
+Dozens of small faces. Look for melted or duplicated ones rather than at the whole frame.
 
 ![04_crowd_faces](examples/fidelity_sheets/sheet_base_04_crowd_faces.jpg)
 
-**05_symmetry_pattern** -- Repeating geometry. Breaks in the tiling are far easier to see than colour drift.
+### 05_symmetry_pattern
+
+> A perfectly symmetrical Islamic geometric tile mosaic, intricate repeating star and polygon pattern, deep blue and gold, overhead flat lighting, ultra sharp
+
+Repeating geometry. Breaks in the tiling are far easier to see than colour drift.
 
 ![05_symmetry_pattern](examples/fidelity_sheets/sheet_base_05_symmetry_pattern.jpg)
 
-**06_multi_subject** -- Two people acting at once -- tweezers in one pair of hands, sauce in the other.
+### 06_multi_subject
+
+> Two chefs in white uniforms plating a dish together in a busy kitchen, one holding tweezers placing a garnish, the other pouring sauce, steam rising, low angle shot
+
+Two people acting at once -- tweezers in one pair of hands, sauce in the other.
 
 ![06_multi_subject](examples/fidelity_sheets/sheet_base_06_multi_subject.jpg)
 
-**07_reflections_glass** -- Condensation and bokeh reflected through liquid. High frequency, little structure.
+### 07_reflections_glass
+
+> A glass of iced whiskey on a dark wood bar, condensation droplets, warm bokeh lights reflected in the glass and the liquid, macro photography
+
+Condensation and bokeh reflected through liquid. High frequency, little structure.
 
 ![07_reflections_glass](examples/fidelity_sheets/sheet_base_07_reflections_glass.jpg)
 
-**08_logo_typography** -- Serif signage on curved chrome: text and specular highlight in the same place.
+### 08_logo_typography
+
+> A vintage motorcycle fuel tank with a hand-painted logo reading 'IRON WOLF GARAGE' in bold serif letters, chrome and scratched paint texture, studio product shot
+
+Serif signage on curved chrome: text and specular highlight in the same place.
 
 ![08_logo_typography](examples/fidelity_sheets/sheet_base_08_logo_typography.jpg)
 
-**09_counting_objects** -- Seven apples, three pears. Miscounting is a structural failure, not a detail one.
+### 09_counting_objects
+
+> A wooden table from directly above with exactly seven red apples arranged in a neat row next to three green pears, soft natural light, flat lay photography
+
+Seven apples, three pears. Miscounting is a structural failure, not a detail one.
 
 ![09_counting_objects](examples/fidelity_sheets/sheet_base_09_counting_objects.jpg)
 
-**10_complex_scene** -- Dense painterly scene. Composition should be identical; brushwork will not be.
+### 10_complex_scene
+
+> A fantasy marketplace street at golden hour, merchant stalls with hanging fabrics and baskets of spices, a dragon perched on a rooftop in the background, dense crowd, painterly digital art
+
+Dense painterly scene. Composition should be identical; brushwork will not be.
 
 ![10_complex_scene](examples/fidelity_sheets/sheet_base_10_complex_scene.jpg)
 
-**11_portrait_woman** -- Skin texture, freckles, catchlights. Where a photographic LoRA earns its keep.
+### 11_portrait_woman
+
+> Close-up portrait of a woman with freckles and green eyes, windswept auburn hair, wearing a chunky knitted wool sweater, standing on a rainy city street at blue hour, shallow depth of field, natural skin texture with visible pores, catchlights in both eyes, 85mm lens, photorealistic
+
+Skin texture, freckles, catchlights. Where a photographic LoRA earns its keep.
 
 ![11_portrait_woman](examples/fidelity_sheets/sheet_base_11_portrait_woman.jpg)
 
-**12_person_holding_sign** -- Handwritten marker text on cardboard at arm's length -- text plus a full body.
+### 12_person_holding_sign
+
+> A young woman in a bright yellow raincoat standing at the end of a wooden pier, holding up a handwritten cardboard sign that reads 'BACK IN 5 MIN' in thick black marker, seagulls circling behind her, overcast diffused light, full body shot, 35mm documentary photography
+
+Handwritten marker text on cardboard at arm's length -- text plus a full body.
 
 ![12_person_holding_sign](examples/fidelity_sheets/sheet_base_12_person_holding_sign.jpg)
 
-**13_two_people_interaction** -- Two faces mid-expression, and the hand-off between them.
+### 13_two_people_interaction
+
+> A barista with tattooed forearms handing a paper cup across a marble counter to a bearded man in a denim jacket, both mid-conversation and smiling, morning light through a tall window, steam rising from the cup, candid documentary photography, natural skin tones
+
+Two faces mid-expression, and the hand-off between them.
 
 ![13_two_people_interaction](examples/fidelity_sheets/sheet_base_13_two_people_interaction.jpg)
 
-**14_hands_and_face** -- Hands, lips and a reflected eye in one frame at extreme close-up.
+### 14_hands_and_face
+
+> A woman applying red lipstick while looking into a small round handheld mirror, her fingers wrapped around the mirror rim, the reflection of one eye visible in the glass, warm bathroom lighting, extreme close-up on face and hands, photorealistic detail
+
+Hands, lips and a reflected eye in one frame at extreme close-up.
 
 ![14_hands_and_face](examples/fidelity_sheets/sheet_base_14_hands_and_face.jpg)
 
-**15_full_body_fashion** -- Fabric folds under hard side light, and whether the stride survives.
+### 15_full_body_fashion
+
+> Full body editorial fashion photograph of a woman in a flowing emerald green silk dress mid-stride on a marble staircase, one hand trailing on the brass railing, dramatic hard side lighting, sharp fabric texture and folds, 50mm, high fashion magazine style
+
+Fabric folds under hard side light, and whether the stride survives.
 
 ![15_full_body_fashion](examples/fidelity_sheets/sheet_base_15_full_body_fashion.jpg)
 
-**16_group_selfie** -- Four faces at once, plus the arm geometry of whoever is holding the phone.
+### 16_group_selfie
+
+> Four friends of different ethnicities crowded around a restaurant table taking a group selfie, one holding the phone at arm's length, another leaning in making a peace sign, plates of pasta and half-full wine glasses on the table, warm indoor lighting, natural candid expressions
+
+Four faces at once, plus the arm geometry of whoever is holding the phone.
 
 ![16_group_selfie](examples/fidelity_sheets/sheet_base_16_group_selfie.jpg)
 
@@ -97,67 +164,131 @@ applied through this repo's LoRA node. The BF16 column carries the LoRA too -- t
 comparison is quantized+LoRA against BF16+LoRA, which is the question the repo's earlier
 LoRA benchmark never asked.
 
-**01_dense_text** -- Three lines of small chalkboard text. The hardest cell in the set: read the prices.
+### 01_dense_text
+
+> A rain-soaked neon diner sign at night, below it a handwritten chalkboard menu with three lines of text reading 'SOUP $4 / PIE $6 / COFFEE $2', reflections on wet asphalt, cinematic
+
+Three lines of small chalkboard text. The hardest cell in the set: read the prices.
 
 ![01_dense_text](examples/fidelity_sheets/sheet_lora2_01_dense_text.jpg)
 
-**02_curved_text** -- Two large words wrapped around a cup. Every checkpoint gets this; it is the easy control.
+### 02_curved_text
+
+> Close-up of a person holding a paper coffee cup with large bold curved text 'STAY WARM' printed around the cup, soft morning light, shallow depth of field
+
+Two large words wrapped around a cup. Every checkpoint gets this; it is the easy control.
 
 ![02_curved_text](examples/fidelity_sheets/sheet_lora2_02_curved_text.jpg)
 
-**03_hands_detail** -- Finger placement on the strings, and whether the motion-blurred bow holds together.
+### 03_hands_detail
+
+> A violinist's hands mid-performance, fingers pressed on the strings, bow in motion with visible blur, studio lighting, extreme close-up, photorealistic
+
+Finger placement on the strings, and whether the motion-blurred bow holds together.
 
 ![03_hands_detail](examples/fidelity_sheets/sheet_lora2_03_hands_detail.jpg)
 
-**04_crowd_faces** -- Dozens of small faces. Look for melted or duplicated ones rather than at the whole frame.
+### 04_crowd_faces
+
+> A busy Tokyo street crossing at dusk, dozens of pedestrians with distinct faces and expressions, neon signage in the background, wide angle, high detail
+
+Dozens of small faces. Look for melted or duplicated ones rather than at the whole frame.
 
 ![04_crowd_faces](examples/fidelity_sheets/sheet_lora2_04_crowd_faces.jpg)
 
-**05_symmetry_pattern** -- Repeating geometry. Breaks in the tiling are far easier to see than colour drift.
+### 05_symmetry_pattern
+
+> A perfectly symmetrical Islamic geometric tile mosaic, intricate repeating star and polygon pattern, deep blue and gold, overhead flat lighting, ultra sharp
+
+Repeating geometry. Breaks in the tiling are far easier to see than colour drift.
 
 ![05_symmetry_pattern](examples/fidelity_sheets/sheet_lora2_05_symmetry_pattern.jpg)
 
-**06_multi_subject** -- Two people acting at once -- tweezers in one pair of hands, sauce in the other.
+### 06_multi_subject
+
+> Two chefs in white uniforms plating a dish together in a busy kitchen, one holding tweezers placing a garnish, the other pouring sauce, steam rising, low angle shot
+
+Two people acting at once -- tweezers in one pair of hands, sauce in the other.
 
 ![06_multi_subject](examples/fidelity_sheets/sheet_lora2_06_multi_subject.jpg)
 
-**07_reflections_glass** -- Condensation and bokeh reflected through liquid. High frequency, little structure.
+### 07_reflections_glass
+
+> A glass of iced whiskey on a dark wood bar, condensation droplets, warm bokeh lights reflected in the glass and the liquid, macro photography
+
+Condensation and bokeh reflected through liquid. High frequency, little structure.
 
 ![07_reflections_glass](examples/fidelity_sheets/sheet_lora2_07_reflections_glass.jpg)
 
-**08_logo_typography** -- Serif signage on curved chrome: text and specular highlight in the same place.
+### 08_logo_typography
+
+> A vintage motorcycle fuel tank with a hand-painted logo reading 'IRON WOLF GARAGE' in bold serif letters, chrome and scratched paint texture, studio product shot
+
+Serif signage on curved chrome: text and specular highlight in the same place.
 
 ![08_logo_typography](examples/fidelity_sheets/sheet_lora2_08_logo_typography.jpg)
 
-**09_counting_objects** -- Seven apples, three pears. Miscounting is a structural failure, not a detail one.
+### 09_counting_objects
+
+> A wooden table from directly above with exactly seven red apples arranged in a neat row next to three green pears, soft natural light, flat lay photography
+
+Seven apples, three pears. Miscounting is a structural failure, not a detail one.
 
 ![09_counting_objects](examples/fidelity_sheets/sheet_lora2_09_counting_objects.jpg)
 
-**10_complex_scene** -- Dense painterly scene. Composition should be identical; brushwork will not be.
+### 10_complex_scene
+
+> A fantasy marketplace street at golden hour, merchant stalls with hanging fabrics and baskets of spices, a dragon perched on a rooftop in the background, dense crowd, painterly digital art
+
+Dense painterly scene. Composition should be identical; brushwork will not be.
 
 ![10_complex_scene](examples/fidelity_sheets/sheet_lora2_10_complex_scene.jpg)
 
-**11_portrait_woman** -- Skin texture, freckles, catchlights. Where a photographic LoRA earns its keep.
+### 11_portrait_woman
+
+> Close-up portrait of a woman with freckles and green eyes, windswept auburn hair, wearing a chunky knitted wool sweater, standing on a rainy city street at blue hour, shallow depth of field, natural skin texture with visible pores, catchlights in both eyes, 85mm lens, photorealistic
+
+Skin texture, freckles, catchlights. Where a photographic LoRA earns its keep.
 
 ![11_portrait_woman](examples/fidelity_sheets/sheet_lora2_11_portrait_woman.jpg)
 
-**12_person_holding_sign** -- Handwritten marker text on cardboard at arm's length -- text plus a full body.
+### 12_person_holding_sign
+
+> A young woman in a bright yellow raincoat standing at the end of a wooden pier, holding up a handwritten cardboard sign that reads 'BACK IN 5 MIN' in thick black marker, seagulls circling behind her, overcast diffused light, full body shot, 35mm documentary photography
+
+Handwritten marker text on cardboard at arm's length -- text plus a full body.
 
 ![12_person_holding_sign](examples/fidelity_sheets/sheet_lora2_12_person_holding_sign.jpg)
 
-**13_two_people_interaction** -- Two faces mid-expression, and the hand-off between them.
+### 13_two_people_interaction
+
+> A barista with tattooed forearms handing a paper cup across a marble counter to a bearded man in a denim jacket, both mid-conversation and smiling, morning light through a tall window, steam rising from the cup, candid documentary photography, natural skin tones
+
+Two faces mid-expression, and the hand-off between them.
 
 ![13_two_people_interaction](examples/fidelity_sheets/sheet_lora2_13_two_people_interaction.jpg)
 
-**14_hands_and_face** -- Hands, lips and a reflected eye in one frame at extreme close-up.
+### 14_hands_and_face
+
+> A woman applying red lipstick while looking into a small round handheld mirror, her fingers wrapped around the mirror rim, the reflection of one eye visible in the glass, warm bathroom lighting, extreme close-up on face and hands, photorealistic detail
+
+Hands, lips and a reflected eye in one frame at extreme close-up.
 
 ![14_hands_and_face](examples/fidelity_sheets/sheet_lora2_14_hands_and_face.jpg)
 
-**15_full_body_fashion** -- Fabric folds under hard side light, and whether the stride survives.
+### 15_full_body_fashion
+
+> Full body editorial fashion photograph of a woman in a flowing emerald green silk dress mid-stride on a marble staircase, one hand trailing on the brass railing, dramatic hard side lighting, sharp fabric texture and folds, 50mm, high fashion magazine style
+
+Fabric folds under hard side light, and whether the stride survives.
 
 ![15_full_body_fashion](examples/fidelity_sheets/sheet_lora2_15_full_body_fashion.jpg)
 
-**16_group_selfie** -- Four faces at once, plus the arm geometry of whoever is holding the phone.
+### 16_group_selfie
+
+> Four friends of different ethnicities crowded around a restaurant table taking a group selfie, one holding the phone at arm's length, another leaning in making a peace sign, plates of pasta and half-full wine glasses on the table, warm indoor lighting, natural candid expressions
+
+Four faces at once, plus the arm geometry of whoever is holding the phone.
 
 ![16_group_selfie](examples/fidelity_sheets/sheet_lora2_16_group_selfie.jpg)
 
