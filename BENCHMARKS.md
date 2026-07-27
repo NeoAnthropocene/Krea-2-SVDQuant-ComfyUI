@@ -133,22 +133,27 @@ with rank — rank 256 is only ~4% slower than rank 16.
 Run with [`tools/fidelity_bench.py`](tools/fidelity_bench.py), which exists because the judge
 above could not be trusted. **16 prompts x 2 seeds = 32 paired cells per arm**, LPIPS(AlexNet)
 against a BF16 reference *generated in the same arm*, 1024x1024 / 8 steps / cfg 1.0 /
-euler+simple, `qwen_image_vae`. Three arms:
+euler+simple, `qwen_image_vae`. Five arms:
 
-| arm | LoRA | covers |
-|---|---|---|
-| `base` | none | — |
-| `lora` | `canon_krea2`, rank 16, photographic style | 448 block + 64 txtfusion keys |
-| `lora2` | `bloomgirls-ultrarealism`, rank 32, realism style | 448 block + 64 txtfusion keys |
+| arm | LoRA | rank | reseed floor |
+|---|---|---|---|
+| `base` | none | — | 0.5468 |
+| `lora` | `canon_krea2`, photographic style | 16 | 0.5193 |
+| `lora2` | `bloomgirls-ultrarealism`, realism style | 32 | 0.5505 |
+| `lora3` | `lenovo_krea2` | 16 | 0.5430 |
+| `lora4` | `nicegirls_krea2` | 16 | 0.5008 |
+
+`base`/`lora`/`lora2` cover the full checkpoint sweep; `lora3`/`lora4` were added later and
+cover r64/r256/r256-actaware only (Test 4).
 
 Two rules this test follows and the old one did not:
 
 * **Paired, not marginal.** Prompt difficulty varies far more than checkpoints do (LPIPS
   0.23-0.42 across this set), so comparing two checkpoints' *means* buries the effect. Every
   number below is `mean(A_i - B_i)` over the same prompt+seed cells.
-* **Each arm has its own reseed floor**, because a LoRA changes how seed-sensitive the model
-  is: 0.5468 (base), 0.5193 (lora), 0.5505 (lora2). Raw LPIPS is therefore **not comparable
-  across arms** — only within one. Divide by the arm's own floor to compare across.
+* **Each arm has its own reseed floor** (table above), because a LoRA changes how
+  seed-sensitive the model is. Raw LPIPS is therefore **not comparable across arms** — only
+  within one. Divide by the arm's own floor to compare across.
 
 ### The result: rank saturates at 64 without a LoRA, and much later with one
 
@@ -204,3 +209,57 @@ Raw data: `fb/fidelity_bench.csv` and `fb/fidelity_bench_summary.json` in the Co
 directory, plus per-prompt contact sheets from
 [`tools/contact_sheet.py`](tools/contact_sheet.py) — LPIPS says how far an image moved, not
 whether it got worse, so the sheets are there to be looked at rather than trusted.
+
+## Test 4 — activation-aware low-rank objective
+
+`svdquant_split()` fits the low-rank branch by minimising `||W - (Q + L1 L2)||_F`. That
+weights every input channel equally, which is only the right objective if every input channel
+carries the same activation energy — and in this model they do not. `--act-stats` replaces it
+with `||(W - (Q + L1 L2)) * d||_F`, where `d` is the per-input-channel activation RMS measured
+on a real calibration pass, normalised to mean 1 and floor-clamped at 0.05. The branch then
+spends its rank where the activations actually are.
+
+Cost at inference: **zero**. Same tensor shapes, same format, same kernels — only the numbers
+in `svdq_l1`/`svdq_l2` differ. It is a build-time change only.
+
+Calibration: 8 prompts (deliberately disjoint from the 16 benchmark prompts, so the
+checkpoint is not tuned on what judges it), BF16 model, hooks on all 224 branched linears via
+`Krea2SVDQuantCaptureStart` / `Krea2SVDQuantCaptureSave`.
+
+Paired `r256 vs r256-actaware`, same 32 cells per arm (**positive = act-aware is closer to
+BF16**):
+
+| arm | LoRA | mean | t | actaware wins |
+|---|---|---|---|---|
+| `base` | none | **+0.0553** | **4.68*** | 27/32 |
+| `lora` | canon | -0.0220 | 1.67 | 9/32 |
+| `lora2` | bloomgirls | +0.0118 | 0.67 | 19/32 |
+| `lora3` | lenovo | +0.0098 | 0.76 | 15/32 |
+| `lora4` | nicegirls | +0.0120 | 0.84 | 14/32 |
+
+Without a LoRA the gain is large and unambiguous: LPIPS 0.3378 to **0.2825**, PSNR 15.20 to
+**16.48**, SSIM 0.6339 to **0.6760**, and it beats *every* other checkpoint in the sweep
+including r256. It also beats `no low-rank` at t=7.86 (2/32) — the widest margin any
+checkpoint reaches in this benchmark.
+
+Under a LoRA the gain shrinks to roughly nothing, and in the `canon` arm it goes slightly
+negative. The honest reading: **four of the five arms point the same way and the fifth is
+inside the noise** (t=1.67, and its own reseed floor is the lowest of the LoRA arms), so this
+is not evidence of a general act-aware/LoRA incompatibility. The plausible mechanism is
+calibration mismatch — the statistics were captured with no LoRA loaded, so they describe
+activation energy the LoRA then shifts. Recalibrating with the adapter loaded is untested.
+
+`r256-actaware` beats `r64` in every arm (t = 3.44 / 2.69 / 3.49 / 3.06 / 1.89), so nothing
+here reverses the Test 3 recommendation.
+
+**Recommendation: build with `--act-stats` — it is free at runtime, clearly better with no
+LoRA, and neutral with one.**
+
+```bash
+python quantize_krea2.py --input turbo.safetensors --format svdq --rank 256 \
+  --act-stats krea2_act_stats.safetensors
+```
+
+Ruled out as confounds: `r256` and `r256-actaware` share source, rank, `refine_iters=100`,
+`groupsize=256` and all 224 branch sites. The activation weighting is the only variable.
+With `act_rms=None` the code path is bit-identical to the old one given the same RNG seed.

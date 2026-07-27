@@ -85,6 +85,8 @@ ARM_LORA = {
     "base": None,
     "lora": "canon_krea2.safetensors",                      # rank 16, photographic style
     "lora2": "bloomgirls-ultrarealism-krea2_4k.safetensors", # rank 32, realism style
+    "lora3": "lenovo_krea2.safetensors",                    # rank 16
+    "lora4": "nicegirls_krea2.safetensors",                 # rank 16
 }
 
 # Loader choice is a property of the file, so it lives with the file rather than being
@@ -98,6 +100,9 @@ CHECKPOINTS = {
     "r64":       {"file": "Krea2-Turbo-SVDQuant-W4A4-rank64.safetensors", "loader": "svdq", "quantized": True},
     "r128":      {"file": "Krea2-Turbo-SVDQuant-W4A4-rank128.safetensors","loader": "svdq", "quantized": True},
     "r256":      {"file": "Krea2-Turbo-SVDQuant-W4A4-rank256.safetensors","loader": "svdq", "quantized": True},
+    # Same rank, same size, same kernel -- built with --act-stats so the low-rank split is
+    # weighted by measured activation RMS instead of plain weight magnitude.
+    "r256aa":    {"file": "Krea2-Turbo-SVDQuant-W4A4-rank256-actaware.safetensors", "loader": "svdq", "quantized": True},
 }
 
 # The repo's established prompt set (the same ids BENCHMARKS.md and pixel_metrics.csv use),

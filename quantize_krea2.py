@@ -292,8 +292,33 @@ def svd_lowrank(weight: torch.Tensor, rank: int, oversample: int = 16, niter: in
     return (u_r * s_r.unsqueeze(0)).contiguous(), vh_r.contiguous()
 
 
+def _act_weighting(act_rms: torch.Tensor | None, in_features: int, device, floor: float = 0.05):
+    """Turn a captured activation RMS vector into the column weighting `d`, or None.
+
+    Normalised to mean 1 so the weighting only redistributes emphasis and never rescales the
+    problem -- otherwise the error metric would no longer be comparable across layers and the
+    refinement loop's stopping threshold would mean something different in each one.
+
+    The floor matters more than it looks. `l2` is recovered by dividing by `d`, so a channel
+    whose activation is ~0 would divide a finite number by ~0 and put an enormous row into the
+    branch -- a branch that then dominates the output for a channel the model never actually
+    drives. Clamping to 5% of the mean bounds that amplification at 20x.
+    """
+    if act_rms is None:
+        return None
+    d = act_rms.to(device=device, dtype=torch.float32).flatten()
+    if d.numel() != in_features:
+        raise RuntimeError("activation stats have {} channels but the weight has {}"
+                           .format(d.numel(), in_features))
+    mean = d.mean()
+    if not torch.isfinite(mean) or mean <= 0:
+        return None
+    d = d / mean
+    return d.clamp(min=floor)
+
+
 def svdquant_split(weight: torch.Tensor, rank: int, fmt: str, groupsize: int,
-                   refine_iters: int = 100):
+                   refine_iters: int = 100, act_rms: torch.Tensor | None = None):
     """SVDQuant ordering: pull a low-rank bf16 branch out of W, quantize the residual.
 
     The low-rank branch absorbs the outlier-heavy directions, so the part that has to
@@ -319,7 +344,12 @@ def svdquant_split(weight: torch.Tensor, rank: int, fmt: str, groupsize: int,
     non-finite); the caller quantizes those without a branch rather than aborting.
     """
     w = weight.float()
-    w_norm = torch.linalg.matrix_norm(w).item()
+    d = _act_weighting(act_rms, w.shape[1], w.device)
+    # With a weighting, both the SVD and the error metric work in the scaled space: minimising
+    # ||(W - W_hat) diag(d)|| approximates the error the layer's real inputs would produce,
+    # which is what actually reaches the image. Without one this is the identity and the whole
+    # function reduces to exactly the old behaviour.
+    w_norm = torch.linalg.matrix_norm(w if d is None else w * d).item()
     if not math.isfinite(w_norm) or w_norm == 0.0:
         return None
     qw = torch.zeros((), device=w.device, dtype=torch.float32)
@@ -327,18 +357,30 @@ def svdquant_split(weight: torch.Tensor, rank: int, fmt: str, groupsize: int,
     best = None
     best_err = float("inf")
     for _ in range(max(1, refine_iters)):
-        l1, l2 = svd_lowrank(w - qw, rank, oversample=16, niter=2)
+        target = w - qw
+        if d is None:
+            l1, l2 = svd_lowrank(target, rank, oversample=16, niter=2)
+        else:
+            # Fit in the scaled space so the retained directions are the ones that matter
+            # once real activations hit them, then undo the scale on `l2` so `l1 @ l2` is
+            # still an approximation of the *unscaled* residual.
+            l1, l2s = svd_lowrank(target * d, rank, oversample=16, niter=2)
+            l2 = l2s / d
+            del l2s
         l1 = l1.to(torch.bfloat16)
         l2 = l2.to(torch.bfloat16)
         lw = l1.float() @ l2.float()
+        # The quantizer must see the unscaled residual: the scale is an analysis device, and
+        # baking it into what gets written would change what the kernel reconstructs.
         residual = (w - lw).to(torch.bfloat16)
 
         qdata, params, layout, _ = _quantize_raw(residual, fmt, groupsize)
         qw = layout.dequantize(qdata, params).float()
         del qdata, params
 
-        err = (torch.linalg.matrix_norm(w - (lw + qw)) / w_norm).item()
-        del lw
+        left = w - (lw + qw)
+        err = (torch.linalg.matrix_norm(left if d is None else left * d) / w_norm).item()
+        del lw, left
         # NaN fails every comparison, so without this the loop would neither break nor
         # ever update `best` -- it would burn all `refine_iters` and return the last
         # split rather than the best one.
@@ -385,9 +427,22 @@ def conf_tensor(conf: dict) -> torch.Tensor:
     return torch.tensor(list(json.dumps(conf).encode("utf-8")), dtype=torch.uint8)
 
 
+def load_act_stats(path: str) -> dict[str, torch.Tensor]:
+    """Read the file the capture nodes write: {layer name: per-input-channel RMS}."""
+    from safetensors import safe_open
+
+    stats = {}
+    with safe_open(path, framework="pt", device="cpu") as handle:
+        for key in handle.keys():
+            stats[key] = handle.get_tensor(key)
+    if not stats:
+        raise RuntimeError("{} contains no activation statistics".format(path))
+    return stats
+
+
 def convert(src: str, dst: str, fmt: str, groupsize: int, device: str = "cuda", rank: int = 0,
             refine_iters: int = 100, variant: str = "unknown", progress_cb=None,
-            rank_alloc: str = "uniform"):
+            rank_alloc: str = "uniform", act_stats: str | None = None):
     """Quantize `src` into `dst`. Returns the summary line it printed.
 
     `rank` is a budget, `rank_alloc` decides how it is spread across the eight projection
@@ -407,6 +462,9 @@ def convert(src: str, dst: str, fmt: str, groupsize: int, device: str = "cuda", 
     ranks = leaf_ranks(rank, rank_alloc) if rank > 0 else {}
     used_ranks: set[int] = set()
     clamped: dict[str, int] = {}
+    stats = load_act_stats(act_stats) if act_stats else {}
+    stats_used = 0
+    stats_missing: list[str] = []
     t0 = time.time()
 
     with safe_open(src, framework="pt", device="cpu") as handle:
@@ -441,7 +499,16 @@ def convert(src: str, dst: str, fmt: str, groupsize: int, device: str = "cuda", 
                     if leaf and leaf_rank < wanted:
                         clamped[leaf] = leaf_rank
                     if leaf_rank > 0:
-                        split = svdquant_split(w, leaf_rank, fmt, groupsize, refine_iters)
+                        # Stats are keyed by module path (`blocks.0.attn.wq`); checkpoint
+                        # keys may carry a prefix, so strip it to look them up.
+                        act = stats.get(layer[len(prefix):] if prefix else layer)
+                        if stats:
+                            if act is None:
+                                stats_missing.append(layer)
+                            else:
+                                stats_used += 1
+                        split = svdquant_split(w, leaf_rank, fmt, groupsize, refine_iters,
+                                               act_rms=act)
                         if split is None:
                             print("  warning: {} is degenerate (zero or non-finite); "
                                   "quantizing it without a low-rank branch".format(layer),
@@ -489,6 +556,18 @@ def convert(src: str, dst: str, fmt: str, groupsize: int, device: str = "cuda", 
                     ", ".join(sorted(observed_leaves)) or "none")
         )
 
+    # Partial statistics are the quiet-wrongness case this file hard-fails on elsewhere: the
+    # covered layers would get an activation-aware split and the rest a plain one, producing a
+    # checkpoint that is neither, and no measurement of it would mean anything.
+    if stats and stats_missing:
+        raise RuntimeError(
+            "activation stats cover {} of {} branched layers; {} are missing, e.g. {}.\n"
+            "The capture run did not see every layer -- usually because sampling was "
+            "interrupted, or the statistics came from a different model. Re-capture rather "
+            "than building a checkpoint that is activation-aware in some layers and not "
+            "others.".format(stats_used, stats_used + len(stats_missing), len(stats_missing),
+                             ", ".join(stats_missing[:3])))
+
     # A leaf can only be clamped when the allocation asked for more rank than the weight is
     # wide, which means part of the budget went unspent and the file is *smaller* than the
     # uniform one -- so a comparison against uniform at this budget is no longer like-for-like.
@@ -526,6 +605,9 @@ def convert(src: str, dst: str, fmt: str, groupsize: int, device: str = "cuda", 
         "krea2_svdquant_branched_layers": str(branched),
         "krea2_svdquant_source_name": os.path.basename(src),
         "krea2_svdquant_source_bytes": str(os.path.getsize(src)),
+        # Two checkpoints with identical rank/refine settings are still different models if
+        # one was activation-weighted, so this has to be recoverable from the file.
+        "krea2_svdquant_act_stats": os.path.basename(act_stats) if act_stats else "",
     }
     if progress_cb is not None:
         progress_cb(quantized, _EXPECTED_LAYERS, "writing {:.2f} GB ...".format(
@@ -587,7 +669,8 @@ def resolve_format(fmt_name: str, rank: int, rank_was_set: bool = True) -> tuple
 
 
 def derive_out_path(src: str, fmt_name: str, rank: int, variant: str,
-                    rank_alloc: str = "uniform") -> tuple[str, str | None]:
+                    rank_alloc: str = "uniform", act_stats: str | None = None
+                    ) -> tuple[str, str | None]:
     """The default output path, plus a note to show when the source name is uninformative."""
     stem = os.path.splitext(os.path.basename(src))[0]
     note = None
@@ -600,7 +683,10 @@ def derive_out_path(src: str, fmt_name: str, rank: int, variant: str,
     # The allocation goes in the filename because two checkpoints with the same budget and
     # different allocations are the same size -- nothing else would tell them apart.
     alloc_tag = "" if rank_alloc == "uniform" else "-{}".format(rank_alloc)
-    suffix = ("SVDQuant-W4A4-rank{}{}".format(rank, alloc_tag) if rank else
+    # Same reasoning as alloc_tag: an activation-weighted build is byte-identical in shape to
+    # a plain one, so without a tag the two are indistinguishable on disk.
+    act_tag = "-actaware" if act_stats else ""
+    suffix = ("SVDQuant-W4A4-rank{}{}{}".format(rank, alloc_tag, act_tag) if rank else
               ("{}-convrot".format(fmt_name.upper()) if fmt_name != "fp8" else "FP8"))
     return os.path.join(os.path.dirname(src), "{}-{}.safetensors".format(stem, suffix)), note
 
@@ -626,9 +712,22 @@ def main():
                     help="which Krea 2 release this is. Only affects the output filename "
                          "and the recorded metadata -- quantization is identical for both, "
                          "the difference is the sampler settings you run afterwards")
+    ap.add_argument("--act-stats", default=None, metavar="PATH",
+                    help="svdq only: activation statistics from the Krea2 SVDQuant Capture "
+                         "nodes. Weights the low-rank split by per-input-channel activation "
+                         "RMS, so the branch spends its capacity on the directions the model "
+                         "actually drives instead of on the largest weights. Costs nothing "
+                         "at runtime -- same rank, format, size and kernel")
     ap.add_argument("--out", default=None)
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
+
+    if args.act_stats:
+        if args.format != "svdq":
+            raise SystemExit("--act-stats only applies to format 'svdq': it weights the "
+                             "low-rank split, and the other formats have no branch")
+        if not os.path.exists(args.act_stats):
+            raise SystemExit("--act-stats file not found: {}".format(args.act_stats))
 
     # RuntimeError is the shared failure type (see `convert`); the CLI wants SystemExit so it
     # prints one clean line instead of a traceback.
@@ -643,12 +742,13 @@ def main():
 
     out = args.out
     if out is None:
-        out, note = derive_out_path(args.src, args.format, rank, args.variant, args.rank_alloc)
+        out, note = derive_out_path(args.src, args.format, rank, args.variant, args.rank_alloc,
+                                    args.act_stats)
         if note:
             print(note, flush=True)
     try:
         convert(args.src, out, fmt, args.groupsize, args.device, rank, args.refine_iters,
-                variant=args.variant, rank_alloc=args.rank_alloc)
+                variant=args.variant, rank_alloc=args.rank_alloc, act_stats=args.act_stats)
     except RuntimeError as exc:
         raise SystemExit(str(exc)) from None
 

@@ -142,15 +142,18 @@ in this upload; `quantize_krea2.py` reproduces them exactly (`--rank 32` / `--ra
 |---|---|
 | `quantize_krea2.py` | Converts a BF16 Krea 2 checkpoint to int8, w4a4, or w4a4 + low-rank (svdq) |
 | `svdquant_w4a4.py` | The **Krea2 SVDQuant W4A4 Loader** node — loads `--format svdq` checkpoints (self-contained, no base model needed) |
-| `svdquant_lora.py` | The **Krea2 SVDQuant LoRA Loader** node — the stock ComfyUI LoRA loader silently skips the quantized layers on these models |
+| `svdquant_lora.py` | The **Krea2 SVDQuant LoRA Loader** node — applies LoRAs as a parallel branch so the 4-bit weight is never dequantized |
 | `svdquant_quantize.py` | The **Krea2 SVDQuant Quantize** node — the quantizer above, run from inside ComfyUI instead of a terminal |
+| `svdquant_capture.py` | The **Krea2 SVDQuant Capture Start/Save** nodes — record per-channel activation RMS for `--act-stats` |
 | `svdquant_diag.py` | The **Krea2 SVDQuant Diagnostics** and **Krea2 SVDQuant Env Check** nodes — which kernel actually runs, plus memory accounting and per-layer timings |
 | `diagnose.py` | The same reports from a terminal, without starting ComfyUI |
 | `tools/build_workflows.py` | Regenerates `workflows/*.json`. Edit this, not the JSON |
 | `tools/pixel_metrics.py` | LPIPS/PSNR/SSIM against a BF16 reference — see [Benchmarks](#benchmarks) |
+| `tools/fidelity_bench.py` | Paired multi-seed multi-LoRA LPIPS harness — every fidelity claim here comes from it |
+| `tools/contact_sheet.py` | Per-prompt contact sheets (checkpoints x seeds) for looking at, not scoring |
 | `workflows/*.json` | Example workflows — see the format note below |
 
-Installing this adds five nodes, all under the **Krea2/SVDQuant** category:
+Installing this adds seven nodes, all under the **Krea2/SVDQuant** category:
 
 | node | what it is for |
 |---|---|
@@ -159,6 +162,7 @@ Installing this adds five nodes, all under the **Krea2/SVDQuant** category:
 | **Krea2 SVDQuant Quantize** | Builds a quantized checkpoint without leaving ComfyUI. Blocks the queue while it runs (54 s to ~6 min) and writes ~8 GB |
 | **Krea2 SVDQuant Diagnostics** | Backend dispatch, memory accounting, per-layer timings, profiler table |
 | **Krea2 SVDQuant Env Check** | Is the int4 kernel available at all? Needs no model, so you can ask before downloading 8 GB |
+| **Krea2 SVDQuant Capture Start** / **Capture Save** | Record activation statistics for an activation-aware build — see [`--act-stats`](#activation-aware-branch---act-stats) |
 
 ### Two workflow formats, and why
 
@@ -292,13 +296,46 @@ python quantize_krea2.py model.safetensors --format svdq --rank 64 --refine-iter
 <details>
 <summary>What the objective is, and the remaining gap to DeepCompressor</summary>
 
-The objective here is weight reconstruction error, which needs no calibration data — it
-is the true output error under the assumption that the input covariance is identity, and
-spreading outliers with the convrot rotation is what makes that assumption reasonable.
-Closing the rest of the gap to DeepCompressor means measuring the real covariance from
-sample data, which is what makes their conversions take hours rather than minutes.
+The default objective here is weight reconstruction error, which needs no calibration data
+— it is the true output error under the assumption that the input covariance is identity,
+and spreading outliers with the convrot rotation is what makes that assumption reasonable.
+`--act-stats` (below) relaxes that assumption to a measured per-channel diagonal; the full
+covariance, which is what makes DeepCompressor's conversions take hours, is still not
+modelled.
 
 </details>
+
+#### Activation-aware branch (`--act-stats`)
+
+Identity input covariance is an approximation, and a measurable one. Capture the real
+per-input-channel activation RMS on a calibration pass, then fit the branch against
+`||(W - (Q + L1 L2)) * d||_F` instead — the branch spends its rank where the activations
+actually are. `d` is normalised to mean 1 and floor-clamped at 0.05 so a near-dead channel
+cannot dominate the fit.
+
+**This costs nothing at inference.** Same shapes, same format, same kernels — only the
+values inside `svdq_l1`/`svdq_l2` change.
+
+Two nodes capture the statistics (they hook all 224 branched linears on a BF16 model):
+
+1. **Krea2 SVDQuant Capture Start** — between your model loader and the sampler.
+2. **Krea2 SVDQuant Capture Save** — takes the sampler's `LATENT` so it runs after
+   denoising; set `keep_capturing` on every prompt but the last so several prompts
+   accumulate into one file. Writes to `models/krea2_act_stats/`.
+
+Use prompts that are *not* the ones you plan to judge the checkpoint with, then:
+
+```bash
+python quantize_krea2.py model.safetensors --format svdq --rank 256 \
+  --act-stats krea2_act_stats.safetensors
+```
+
+The output filename gains an `-actaware` tag and the file records which stats built it in
+`krea2_svdquant_act_stats`. Missing stats for any branched layer is a hard error rather
+than a silent fallback. Measured effect: without a LoRA, LPIPS to BF16 drops 0.3378 to
+**0.2825** (t=4.68, 27/32 prompts), beating every other checkpoint in the sweep; with a
+LoRA it is neutral across four adapters. See
+[Test 4 in BENCHMARKS.md](BENCHMARKS.md#test-4--activation-aware-low-rank-objective).
 
 ## Benchmarks
 
@@ -411,10 +448,31 @@ graph breaks so inductor still fuses everything around them. First run after loa
 ## LoRA
 
 Use **Krea2 SVDQuant LoRA Loader**, not the stock `LoraLoaderModelOnly`. The stock loader
-patches `weight += down @ up`, but on these models `.weight` is a `QuantizedTensor` —
-patching it that way would mean dequantize → add → requantize, losing the format. In
-practice it silently matches only the ~32 non-quantized layers (text-fusion) out of ~256
-and misses all 224 transformer-block layers, with no error.
+patches `weight += down @ up`, but on these models `.weight` is a `QuantizedTensor`, so
+applying it that way means dequantize → add → requantize: the branch's whole point, keeping
+the 4-bit weight untouched, is lost, and the LoRA delta is re-quantized to 4 bits along
+with it.
+
+<details>
+<summary>Does the stock loader silently skip the quantized layers? Measured: no longer</summary>
+
+This was documented here as "it matches only the ~32 non-quantized layers out of ~256 and
+misses all 224 transformer-block layers, with no error." Re-tested against ComfyUI **0.28.0**
+(commit `f966a2b3`) on both `W4A4-convrot` and `SVDQuant-W4A4-rank256`, by patching the same
+checkpoint at LoRA strength 1.0 and 4.0 and diffing every weight — a layer that was skipped
+would be bit-identical between the two:
+
+```
+key map offers 224/224 of the quantized layers
+load_lora produced 256 patches; add_patches accepted 256 keys
+strength 1.0 vs 4.0:  quantized 224/224 differ,  plain 32/32 differ
+```
+
+All 224 do move, so the coverage claim does not hold on current ComfyUI. We have not
+bisected when that changed. The reason to use this repo's node is the requantization above,
+not missing coverage.
+
+</details>
 
 The included loader instead attaches the LoRA as a parallel low-rank branch, which is
 mathematically identical for a linear layer (`(W + BA)x == Wx + B(Ax)`) and leaves the
