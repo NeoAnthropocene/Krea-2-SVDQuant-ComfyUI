@@ -21,11 +21,13 @@ comparable. RTX 3090, cu130 torch build.
 reflections, counting, complex composition), same seed, 1024x1024, 8 steps, cfg 1.0.
 Checkpoints: BF16 reference, W4A4 with no low-rank branch, and SVDQuant rank 16/32/64/128/256
 in both the fast single-shot split (`--refine-iters 0`, "no refine") and the alternating-refit
-version (default, "refined") — see the main README's [Low-rank refinement](README.md#low-rank-refinement)
+version (default, "refined") — see the main README's [Build your own checkpoint](README.md#build-your-own-checkpoint)
 section for what that flag changes.
 
 [`examples/rank_sweep_t2i_comparison/`](examples/rank_sweep_t2i_comparison/) — one grid PNG
-per prompt, all 12 checkpoints side by side with the gemini quality score under each tile.
+per prompt, all 12 checkpoints side by side. The tiles have the judge's score printed under
+them; those numbers are the withdrawn ones, baked into the images. Ignore them and look at
+the images.
 
 | id | prompt | stresses |
 |---|---|---|
@@ -40,16 +42,7 @@ per prompt, all 12 checkpoints side by side with the gemini quality score under 
 | 09_counting_objects | "A wooden table from directly above with exactly seven red apples arranged in a neat row next to three green pears, soft natural light, flat lay photography" | object counting |
 | 10_complex_scene | "A fantasy marketplace street at golden hour, merchant stalls with hanging fabrics and baskets of spices, a dragon perched on a rooftop in the background, dense crowd, painterly digital art" | complex composition |
 
-![01_dense_text](examples/rank_sweep_t2i_comparison/grid_01_dense_text.png)
-![02_curved_text](examples/rank_sweep_t2i_comparison/grid_02_curved_text.png)
-![03_hands_detail](examples/rank_sweep_t2i_comparison/grid_03_hands_detail.png)
-![04_crowd_faces](examples/rank_sweep_t2i_comparison/grid_04_crowd_faces.png)
-![05_symmetry_pattern](examples/rank_sweep_t2i_comparison/grid_05_symmetry_pattern.png)
-![06_multi_subject](examples/rank_sweep_t2i_comparison/grid_06_multi_subject.png)
-![07_reflections_glass](examples/rank_sweep_t2i_comparison/grid_07_reflections_glass.png)
-![08_logo_typography](examples/rank_sweep_t2i_comparison/grid_08_logo_typography.png)
-![09_counting_objects](examples/rank_sweep_t2i_comparison/grid_09_counting_objects.png)
-![10_complex_scene](examples/rank_sweep_t2i_comparison/grid_10_complex_scene.png)
+All ten grids: [GALLERY.md](GALLERY.md#rank-sweep-refined-vs-not).
 
 ## Test 2 — krea2edit LoRA (identity-preserving editing)
 
@@ -57,16 +50,14 @@ Same rank sweep, this time with the [Krea 2 Identity Edit LoRA](https://github.c
 on top, using its `Krea2EditModelPatch` / `Krea2EditGroundedEncode` nodes wired exactly per
 the LoRA repo's example workflow (`ref_boost=4`, `fit_mode=fit`, `grounding_px=768`,
 10 steps, cfg 1.0). Quantized checkpoints use this repo's **Krea2 SVDQuant LoRA Loader**
-node instead of the stock LoRA loader — the stock loader silently skips the quantized
-layers on these models (see the main README's [LoRA](README.md#lora) section).
+node instead of the stock one, which would dequantize the weight to apply the LoRA and then
+requantize both together (see the main README's [LoRA](README.md#lora) section).
+
+Source photographs are in [GALLERY.md](GALLERY.md#identity-edit-lora).
 
 Three real stock photos of different women, resized to 1024x1536 before editing (feeding
 multi-thousand-pixel originals straight into VAEEncode wastes VRAM/time for no quality
 gain at this model's ~1MP working resolution).
-
-| woman 1 | woman 2 | woman 3 |
-|---|---|---|
-| ![woman1](examples/krea2edit_lora_comparison/source_photos/source_woman1.png) | ![woman2](examples/krea2edit_lora_comparison/source_photos/source_woman2.png) | ![woman3](examples/krea2edit_lora_comparison/source_photos/source_woman3.png) |
 
 | id | source | instruction |
 |---|---|---|
@@ -77,12 +68,7 @@ gain at this model's ~1MP working resolution).
 | e5_paris_w3 | woman 3 | "Place her in Paris with the Eiffel Tower visible behind her, keep her exact face, hairstyle, and outfit unchanged." |
 | e6_night_lights_off_w3 | woman 3 | "Change the lighting to nighttime with all lights turned off, dark and moody atmosphere, keep her exact face unchanged." |
 
-![e1_paris_w1](examples/krea2edit_lora_comparison/grid_e1_paris_w1.png)
-![e2_sunset_sky_w1](examples/krea2edit_lora_comparison/grid_e2_sunset_sky_w1.png)
-![e3_horse_w2](examples/krea2edit_lora_comparison/grid_e3_horse_w2.png)
-![e4_night_lights_off_w2](examples/krea2edit_lora_comparison/grid_e4_night_lights_off_w2.png)
-![e5_paris_w3](examples/krea2edit_lora_comparison/grid_e5_paris_w3.png)
-![e6_night_lights_off_w3](examples/krea2edit_lora_comparison/grid_e6_night_lights_off_w3.png)
+All six edit grids: [GALLERY.md](GALLERY.md#identity-edit-lora).
 
 ## Results
 
@@ -242,24 +228,135 @@ Without a LoRA the gain is large and unambiguous: LPIPS 0.3378 to **0.2825**, PS
 including r256. It also beats `no low-rank` at t=7.86 (2/32) — the widest margin any
 checkpoint reaches in this benchmark.
 
-Under a LoRA the gain shrinks to roughly nothing, and in the `canon` arm it goes slightly
-negative. The honest reading: **four of the five arms point the same way and the fifth is
-inside the noise** (t=1.67, and its own reseed floor is the lowest of the LoRA arms), so this
-is not evidence of a general act-aware/LoRA incompatibility. The plausible mechanism is
-calibration mismatch — the statistics were captured with no LoRA loaded, so they describe
-activation energy the LoRA then shifts. Recalibrating with the adapter loaded is untested.
+Under a LoRA the gain shrinks to roughly nothing: three of the four LoRA arms are positive and
+one (`canon`) is slightly negative at t=1.67 — inside the noise, and the only arm of the five
+pointing that way. **Four of five agree, so this is not evidence of an act-aware/LoRA
+incompatibility**, and nothing here says avoid it with a LoRA. The plausible mechanism for the
+shrinkage is calibration mismatch: the statistics were captured with no LoRA loaded, so they
+describe activation energy the adapter then shifts. Recalibrating with the adapter loaded is
+untested, and is the obvious next experiment for anyone picking this up.
 
-`r256-actaware` beats `r64` in every arm (t = 3.44 / 2.69 / 3.49 / 3.06 / 1.89), so nothing
-here reverses the Test 3 recommendation.
+`r256-actaware` also beats `r64` in every arm (t = 3.44 / 2.69 / 3.49 / 3.06 / 1.89), so
+nothing here reverses the Test 3 recommendation either.
 
-**Recommendation: build with `--act-stats` — it is free at runtime, clearly better with no
-LoRA, and neutral with one.**
+**Recommendation: build with `--act-stats`, whether or not you use LoRAs.** Free at runtime,
+the largest fidelity gain measured in this repo without one, no worse with one — there is no
+configuration in which the plain objective is the better choice.
 
 ```bash
-python quantize_krea2.py --input turbo.safetensors --format svdq --rank 256 \
+python quantize_krea2.py turbo.safetensors --format svdq --rank 256 \
   --act-stats krea2_act_stats.safetensors
 ```
 
 Ruled out as confounds: `r256` and `r256-actaware` share source, rank, `refine_iters=100`,
 `groupsize=256` and all 224 branch sites. The activation weighting is the only variable.
 With `act_rms=None` the code path is bit-identical to the old one given the same RNG seed.
+
+## Speed and per-layer accuracy
+
+All numbers measured on an **RTX 3090 24GB**, 1024x1024, 8-step Euler/simple sampling,
+`cfg=1.0` (Krea 2 Turbo distilled schedule), from the same BF16 source checkpoint, on a
+**cu130 torch build** (see [TROUBLESHOOTING.md](TROUBLESHOOTING.md) — on an older build every
+one of these numbers gets worse, and the ordering inverts).
+
+These are Turbo numbers. The base model at ~50 steps with CFG does roughly 12x the
+sampling work per image, so the absolute seconds do not transfer; the *ratios* between
+formats do, since they come from the same per-layer kernels.
+
+#### End to end, per image
+
+Two numbers matter and are easy to conflate: **first run after switching checkpoints**
+(pays disk-to-VRAM load time, ~9-15s here) and **warm run** (model already resident,
+what you get generating multiple images back to back). ComfyUI's own progress bar
+("`8/8 [00:07<00:00, 1.09it/s]`") only covers the KSampler loop; "`Prompt executed in
+X seconds`" is CLIP load/encode + model staging + sampling + VAE decode + save combined
+— the two numbers can differ by 2x on a cold run.
+
+| checkpoint | size | first run (cold) | warm run | vs. BF16 |
+|---|---|---|---|---|
+| BF16 (unquantized reference) | 24.48 GB | 25.3 s | 21.3 s | 1.0x |
+| FP8 e4m3, scaled (emulated on Ampere) | 12.24 GB | 22.2 s | 19.2 s | 1.1x |
+| INT8 tensorwise + convrot (not in this upload) | 13.16 GB | 13.3 s | 10.4 s | 2.0x |
+| **W4A4 + convrot, no low-rank branch** | 7.50 GB | 10.3 s | **10.1 s** | 2.1x |
+| **W4A4 + SVDQuant low-rank, rank 16/64/128** | 7.6-8.3 GB | ~19.3 s | **10.1-10.2 s** | 2.1x |
+
+Rank does not measurably change warm speed — CLIP text-encode (Qwen3-VL 4B) and VAE
+decode overhead dominate a single 1024x1024/8-step/batch-1 image and mask the low-rank
+branch's cost. Add a **TorchCompileModel** node (backend `inductor`) after the loader
+for a further ~20-25% cut on the sampling portion specifically (see profiling below);
+that number does not show up in the table above since it isn't included in this
+upload's default workflow.
+
+**FP8 is not faster than BF16 on Ampere** — there are no FP8 tensor cores on this
+architecture, so ComfyUI casts to bf16 and calls cuBLAS. It's included here because it's
+the most common recommendation online for "quantizing Krea 2," and the numbers show why
+that advice doesn't hold on 30-series cards. **INT8 is the fastest *accurate* option**
+measured, but is not part of this upload (available via `quantize_krea2.py --format
+int8` on your own BF16 checkpoint).
+
+#### Per-layer accuracy (cosine similarity / relative error vs. BF16 original)
+
+Measured on real captured activations from a Krea 2 Turbo forward pass (not synthetic
+noise), across representative attention and MLP layers:
+
+| format | cosine | relative error | per-layer time |
+|---|---|---|---|
+| bf16 (reference) | 1.00000 | - | 1.22 - 3.48 ms |
+| **int8 + convrot (Hadamard rotation)** | 0.99999 | 0.35 - 0.63% | 0.39 - 1.09 ms |
+| int8 per-channel (no rotation) | 0.99993 | 0.45 - 1.47% | 0.35 - 1.01 ms |
+| fp8 e4m3, scaled | 0.99996 | 0.39 - 1.28% | 1.95 - 5.14 ms |
+| nvfp4 | 0.99968 | 0.74 - 4.00% | 1.49 - 3.93 ms |
+| w4a4 + convrot, rank-64 low-rank branch | 0.99933 - 0.99997 | 0.72 - 8.38% | 0.39 - 1.09 ms |
+| w4a4 + convrot, no low-rank branch | 0.99569 - 0.99908 | 1.49 - 9.29% | 0.23 - 0.67 ms |
+
+The Hadamard rotation used by `convrot` already does most of what SVDQuant's low-rank
+branch does (both are outlier-mitigation strategies), so on top of `convrot_w4a4` the
+low-rank branch buys noticeably less than in the original SVDQuant paper — it roughly
+halves the error rather than eliminating it. **`int8` is the more accurate choice if
+quality matters more than raw speed; `svdq` is the faster, smaller choice.**
+
+#### Rank sweep
+
+`--format svdq --rank N` was run for N = 16, 32, 64, 128, 256. Checkpoint sizes:
+
+| rank | size |
+|---|---|
+| 16 | 7.60 GB |
+| 32 | 7.70 GB |
+| 64 | 7.90 GB |
+| 128 | 8.30 GB |
+| 256 | 9.10 GB |
+
+This is an experimental project — the rank sweep is deliberately shipped so people can
+try the tradeoff themselves rather than take one number on faith. If you benchmark other
+ranks or find a case where one clearly wins, open a discussion on this repo.
+
+To measure any of this yourself against a BF16 reference:
+
+```bash
+python tools/fidelity_bench.py generate --output-dir <ComfyUI/output>
+python tools/fidelity_bench.py score    --output-dir <ComfyUI/output>
+python tools/contact_sheet.py           --output-dir <ComfyUI/output> --jpeg 90
+```
+
+`generate` is idempotent, so it can be grown one `--seeds` or `--checkpoints` at a time.
+`score` prints the reseed floor next to every result, which is the number that decides whether
+a difference is claimable. `contact_sheet` builds the sheets in [GALLERY.md](GALLERY.md) --
+the numbers rank, the sheets adjudicate.
+
+#### Where the remaining time goes (profiled, `svdq r64`, single denoise step, 175.7 ms)
+
+| component | share |
+|---|---|
+| W4A4 GEMM (native `comfy_kitchen` cutlass kernel) | 37% |
+| elementwise / norm / RoPE / dtype casts | 34% |
+| attention (cuDNN flash) | 9% |
+| low-rank branch (2 bf16 GEMMs per quantized layer) | 9% |
+| W4A4 activation quantization | 8% |
+
+A third of a step is small elementwise kernels, which is why `torch.compile` (backend
+`inductor`) helps: add a **TorchCompileModel** node after the loader. Stock ComfyUI
+quantized tensors normally break `torch.compile` (Dynamo can't trace into the
+`comfy_kitchen` kernel); the W4A4 loader here works around that by marking those calls as
+graph breaks so inductor still fuses everything around them. First run after loading pays
+~50s of compilation; subsequent runs are warm.
