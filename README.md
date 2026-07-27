@@ -98,9 +98,11 @@ Everything here was built from scratch against ComfyUI's own quantization backen
 | `Krea2-Turbo-SVDQuant-W4A4-rank16.safetensors` | `convrot_w4a4` + low-rank branch | 16 | 7.60 GB |
 | `Krea2-Turbo-SVDQuant-W4A4-rank64.safetensors` | `convrot_w4a4` + low-rank branch | 64 | 7.90 GB |
 | `Krea2-Turbo-SVDQuant-W4A4-rank128.safetensors` | `convrot_w4a4` + low-rank branch | 128 | 8.30 GB |
+| `Krea2-Turbo-SVDQuant-W4A4-rank256.safetensors` | `convrot_w4a4` + low-rank branch | 256 | 9.10 GB |
+| `Krea2-Turbo-SVDQuant-W4A4-rank256-actaware.safetensors` | as above, branch fit against measured activations | 256 | 9.10 GB |
 
-The no-low-rank file loads with the stock ComfyUI **UNETLoader**. The three `svdq`
-checkpoints need the **Krea2 SVDQuant W4A4 Loader** node from this repo (they carry extra
+The no-low-rank file loads with the stock ComfyUI **UNETLoader**. Every `svdq`
+checkpoint needs the **Krea2 SVDQuant W4A4 Loader** node from this repo (they carry extra
 `*.svdq_l1` / `*.svdq_l2` tensors the stock loader doesn't know about).
 
 Higher rank = larger low-rank correction branch = lower weight reconstruction error. Over
@@ -114,9 +116,14 @@ paired over 16 prompts x 2 seeds; details and the numbers are in
 
 | you | pick |
 |---|---|
-| never use LoRAs | **rank 64** — 128 and 256 measure the same, so the extra GB is wasted |
-| use LoRAs | **rank 256** — rank 64 loses most of its advantage under one |
+| never use LoRAs | **rank 256 actaware** — the closest to BF16 of anything here (t=4.68 over plain rank 256); rank 64 if you want the smaller file, since 128 and 256 measure the same without the activation weighting |
+| use LoRAs | **rank 256** — rank 64 loses most of its advantage under one. `actaware` measures neutral here, so either is fine |
 | want the smallest/fastest and can accept the drop | no-low-rank, or rank 16 |
+
+`actaware` is the same format, size and speed — the branch was just fit against measured
+per-channel activation energy instead of assuming it is uniform
+([`--act-stats`](#activation-aware-branch---act-stats)). The calibration file it was built
+from is in `calibration/` so the build is reproducible.
 
 Each file records how it was built in its safetensors metadata (`krea2_svdquant_rank`,
 `krea2_svdquant_refine_iters`, tool version, source file), so you can check what you
