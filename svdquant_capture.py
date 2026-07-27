@@ -23,7 +23,6 @@ and each ComfyUI run is a separate execution. `Start` with `reset=True` on the f
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 
@@ -37,13 +36,18 @@ from .svdquant_diag import _CATEGORY
 # layer name -> {"sumsq": float64 [in_features] on cpu, "count": int}
 _STATS: dict[str, dict] = {}
 _HANDLES: list = []
+# Checked first inside every hook, so a hook that outlives its handle is inert rather than
+# quietly accumulating. A leaked hook is the worst failure this module has: it would keep
+# adding activations from later, unrelated generations into _STATS, and the next calibration
+# file would be contaminated with no sign of it.
+_ACTIVE = False
 
 FILE_VERSION = 1
 
 
 def _hook(name: str):
     def pre_hook(module, args):
-        if not args:
+        if not _ACTIVE or not args:
             return
         x = args[0]
         if not isinstance(x, torch.Tensor) or x.ndim < 2:
@@ -77,25 +81,39 @@ def is_target(name: str) -> bool:
 
 
 def attach(diffusion_model) -> int:
+    global _ACTIVE
     detach()
     count = 0
     for name, module in diffusion_model.named_modules():
         if is_target(name) and getattr(module, "weight", None) is not None:
             _HANDLES.append(module.register_forward_pre_hook(_hook(name)))
             count += 1
+    _ACTIVE = True
     return count
 
 
 def detach() -> None:
+    """Stop capturing, then remove the hooks.
+
+    `_ACTIVE` goes down first so capture stops even for a hook whose handle refuses to
+    detach. A failed handle is kept in `_HANDLES` so the next `detach()` retries it, and the
+    failure is logged at warning -- at DEBUG (ComfyUI's default is INFO) nobody would ever
+    see the one condition that can silently corrupt a calibration file.
+    """
+    global _ACTIVE
+    _ACTIVE = False
+    kept = []
     for handle in _HANDLES:
         try:
             handle.remove()
         except Exception:
-            logging.debug("[krea2-svdquant] could not remove a capture hook", exc_info=True)
-    _HANDLES.clear()
+            logging.warning("[krea2-svdquant] could not remove a capture hook; capture is "
+                            "off but the hook is still installed", exc_info=True)
+            kept.append(handle)
+    _HANDLES[:] = kept
 
 
-def write(path: str, meta: dict | None = None) -> dict:
+def write(path: str) -> dict:
     """RMS per input channel, as a safetensors file keyed by layer name."""
     from safetensors.torch import save_file
 
@@ -117,7 +135,6 @@ def write(path: str, meta: dict | None = None) -> dict:
         "krea2_actstats_min_tokens": str(min(counts)),
         "krea2_actstats_max_tokens": str(max(counts)),
     }
-    metadata.update({k: str(v) for k, v in (meta or {}).items()})
 
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     save_file(tensors, path, metadata=metadata)

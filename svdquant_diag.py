@@ -32,15 +32,28 @@ import comfy.model_management as mm
 # `ck.registry.disable("cuda")` it performs when torch was built against CUDA < 13.
 # Without it we would query a registry ComfyUI has not finished configuring and happily
 # report a CUDA backend that never runs in practice.
-import comfy.quant_ops  # noqa: F401
+_QUANT_OPS_ERROR = None
+try:
+    import comfy.quant_ops  # noqa: F401
+except Exception as exc:  # pragma: no cover - depends on the ComfyUI build
+    # Guarded so a build without quant_ops still gets *this* module, and therefore still gets
+    # Env Check -- the one node whose entire job is explaining a missing quantization backend.
+    # Unguarded, the ImportError would propagate through __init__.py and remove all seven.
+    _QUANT_OPS_ERROR = "{}: {}".format(type(exc).__name__, exc)
+
+# Buffer names for the low-rank factors, chosen to match the on-disk keys exactly: a buffer
+# called ``svdq_l1`` on ``blocks.0.attn.wq`` produces the state-dict key
+# ``blocks.0.attn.wq.svdq_l1``, byte-identical to what quantize_krea2.py writes. So a model
+# re-saved out of ComfyUI round-trips straight back into the loader. Defined here because
+# svdquant_w4a4 imports this module (not the other way round) and both need them.
+BUF_L1 = "svdq_l1"
+BUF_L2 = "svdq_l2"
 
 _CK_IMPORT_ERROR = None
 try:
-    import comfy_kitchen as ck
     from comfy_kitchen.registry import registry as ck_registry
     from comfy_kitchen.tensor.convrot_w4a4 import TensorCoreConvRotW4A4Layout
 except Exception as exc:  # pragma: no cover - depends on the install
-    ck = None
     ck_registry = None
     TensorCoreConvRotW4A4Layout = None
     _CK_IMPORT_ERROR = "{}: {}".format(type(exc).__name__, exc)
@@ -75,10 +88,26 @@ def quantized_linears(diffusion_model):
 
 
 def branch_buffers(module):
-    """(name, tensor) for the low-rank factors attached to a module, in any naming."""
+    """(name, tensor) for every low-rank factor buffer on a module, for summing bytes.
+
+    Use `branch_factors` when you need l1 and l2 individually -- these come back in
+    registration order, which is not something to index positionally.
+    """
     for name, buf in module.named_buffers(recurse=False):
-        if buf is not None and (name.startswith("svdq_l") or name.startswith("_br_l")):
+        if buf is not None and name.startswith("svdq_l"):
             yield name, buf
+
+
+def branch_factors(module):
+    """The (l1, l2) pair attached to a module, or None if it has no branch.
+
+    Keyed by name deliberately. Reading `list(branch_buffers(module))[0]` as l1 happens to
+    work today only because the loader registers l1 first; a third factor or a reordering
+    would silently swap the two and every derived number would look plausible and be wrong.
+    """
+    bufs = getattr(module, "_buffers", {})
+    l1, l2 = bufs.get(BUF_L1), bufs.get(BUF_L2)
+    return None if l1 is None or l2 is None else (l1, l2)
 
 
 def _probe_kwargs(module, tokens: int, device) -> dict:
@@ -255,6 +284,11 @@ def report_backend_status() -> str:
     --no-load` and the env-check node come through here.
     """
     lines = ["torch {}  (cuda build {})".format(torch.__version__, torch.version.cuda), ""]
+    if _QUANT_OPS_ERROR:
+        lines.append("comfy.quant_ops failed to import: {}".format(_QUANT_OPS_ERROR))
+        lines.append("No quantized checkpoint can load on this build, and this repo's "
+                     "quantizer has no formats available. Update ComfyUI.")
+        lines.append("")
     if ck_registry is None:
         lines.append("comfy_kitchen unavailable: {}".format(_CK_IMPORT_ERROR))
         return "\n".join(lines)
@@ -421,8 +455,13 @@ def report_dispatch(patcher, tokens: int) -> list[str]:
     return lines
 
 
-def _timed(fn, reps: int = 20, warmup: int = 3) -> float:
-    """Milliseconds per call, CUDA-synchronised. Returns nan if the call raises."""
+def _timed(fn, reps: int = 20, warmup: int = 3, label: str = "", failures: list | None = None):
+    """Milliseconds per call, CUDA-synchronised. Returns nan if the call raises.
+
+    A failure is logged at *warning* and recorded in `failures`, not swallowed to DEBUG:
+    ComfyUI logs at INFO by default, so a row of bare `nan`s used to arrive with its reason
+    discarded -- the opposite of what a diagnostics tool is for.
+    """
     try:
         for _ in range(warmup):
             fn()
@@ -435,7 +474,10 @@ def _timed(fn, reps: int = 20, warmup: int = 3) -> float:
             torch.cuda.synchronize()
         return (time.perf_counter() - start) * 1000.0 / reps
     except Exception as exc:
-        logging.debug("[krea2-svdquant] bench call failed: %s", exc, exc_info=True)
+        logging.warning("[krea2-svdquant] bench call failed (%s): %s", label or "?", exc,
+                        exc_info=True)
+        if failures is not None:
+            failures.append((label, "{}: {}".format(type(exc).__name__, exc)))
         return float("nan")
 
 
@@ -458,6 +500,7 @@ def report_bench(patcher, tokens: int) -> list[str]:
     lines.append("{:<44} {:>9} {:>9} {:>9} {:>9}".format(
         "layer [in -> out]", "quant ms", "branch ms", "bf16 ms", "quant/bf16"))
 
+    failures: list[tuple[str, str]] = []
     for shape, (name, module) in sorted(_distinct_shapes(patcher.model.diffusion_model).items()):
         out_features, in_features = int(shape[0]), int(shape[1])
         dtype = module.weight._params.orig_dtype
@@ -465,21 +508,31 @@ def report_bench(patcher, tokens: int) -> list[str]:
             dtype = torch.bfloat16
         x = torch.randn((tokens, in_features), dtype=dtype, device=device)
 
-        quant_ms = _timed(lambda: F.linear(x, module.weight))
+        quant_ms = _timed(lambda: F.linear(x, module.weight),
+                          label="{} quant".format(name), failures=failures)
 
-        factors = [buf for _n, buf in branch_buffers(module)]
-        if len(factors) >= 2:
-            a1, a2 = factors[0].to(device=device, dtype=dtype), factors[1].to(device=device, dtype=dtype)
-            branch_ms = _timed(lambda: F.linear(F.linear(x, a2), a1))
-            del a1, a2
-        else:
+        factors = branch_factors(module)
+        if factors is None:
             branch_ms = float("nan")
+            failures.append(("{} branch".format(name), "no svdq_l1/svdq_l2 on this module"))
+        else:
+            l1, l2 = factors
+            a1 = l1.to(device=device, dtype=dtype)
+            a2 = l2.to(device=device, dtype=dtype)
+            branch_ms = _timed(lambda: F.linear(F.linear(x, a2), a1),
+                               label="{} branch".format(name), failures=failures)
+            del a1, a2
 
         try:
             dense = module.weight.dequantize().to(dtype)
-            bf16_ms = _timed(lambda: F.linear(x, dense))
+            bf16_ms = _timed(lambda: F.linear(x, dense),
+                             label="{} bf16".format(name), failures=failures)
             del dense
-        except Exception:
+        except Exception as exc:
+            logging.warning("[krea2-svdquant] could not dequantize %s for the bf16 reference: %s",
+                            name, exc, exc_info=True)
+            failures.append(("{} bf16".format(name),
+                             "dequantize failed: {}: {}".format(type(exc).__name__, exc)))
             bf16_ms = float("nan")
 
         ratio = quant_ms / bf16_ms if bf16_ms == bf16_ms and bf16_ms > 0 else float("nan")
@@ -493,6 +546,13 @@ def report_bench(patcher, tokens: int) -> list[str]:
     lines.append("")
     lines.append("quant/bf16 < 1.0 means the int4 kernel is winning. Above 1.0 means the "
                  "quantized path is being emulated -- check mode=dispatch.")
+    if failures:
+        # Every nan above has to be accountable here. A bench table pasted into an issue is
+        # useless if a column of nans carries no reason with it.
+        lines.append("")
+        lines.append("failed measurements ({}):".format(len(failures)))
+        for label, reason in failures:
+            lines.append("  {:<40} {}".format(label[:40], reason))
     return lines
 
 
@@ -561,6 +621,12 @@ class Krea2SVDQuantDiagnostics:
                 }),
             }
         }
+
+    @classmethod
+    def IS_CHANGED(cls, *args, **kwargs):
+        # Same reasoning as Env Check: this measures the live process (mode=bench times real
+        # kernels), so a cached report would be a report about a previous run.
+        return float("nan")
 
     RETURN_TYPES = ("MODEL", "STRING")
     RETURN_NAMES = ("model", "report")

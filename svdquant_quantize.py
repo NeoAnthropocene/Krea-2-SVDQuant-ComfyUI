@@ -60,9 +60,9 @@ class Krea2SVDQuantQuantize:
                 "rank": ("INT", {
                     "default": 64, "min": 8, "max": 1024, "step": 8,
                     "tooltip": "svdq only: size of the low-rank branch. Only pays off with "
-                               "refine_iters > 0 - measured LPIPS falls monotonically with "
-                               "rank when refining and is flat without it. Each doubling buys "
-                               "about 0.013 LPIPS.",
+                               "refine_iters > 0. Without a LoRA, 64 / 128 / 256 measure the "
+                               "same, so 64 is enough. With a LoRA loaded, 256 wins clearly "
+                               "and 64 loses most of its advantage - so 256 if you use LoRAs.",
                 }),
                 "rank_alloc": (["uniform", "gqa"], {
                     "default": "uniform",
@@ -104,8 +104,27 @@ class Krea2SVDQuantQuantize:
                     "tooltip": "Off means an existing file of the same name is an error "
                                "rather than 8 GB written over your last run.",
                 }),
-            }
+            },
+            # Optional so workflows saved before this input existed keep validating.
+            "optional": {
+                "act_stats": ("STRING", {
+                    "default": "",
+                    "tooltip": "svdq only: an activation-statistics file from the Capture "
+                               "nodes (a bare filename is looked up in ComfyUI/output/). "
+                               "Fits the low-rank branch against measured per-channel "
+                               "activation energy instead of assuming it is uniform. Free at "
+                               "inference and the best-measured setting here - LPIPS to BF16 "
+                               "0.3378 to 0.2825 with no LoRA. Empty means the plain objective.",
+                }),
+            },
         }
+
+    @classmethod
+    def IS_CHANGED(cls, *args, **kwargs):
+        # Writes an ~8 GB file as its side effect, so a cached summary would claim a file
+        # exists that the user may have since deleted. Re-queueing is cheap to refuse
+        # (overwrite=False still fails fast) and expensive to get wrong.
+        return float("nan")
 
     RETURN_TYPES = ("STRING",)
     RETURN_NAMES = ("summary",)
@@ -120,7 +139,7 @@ class Krea2SVDQuantQuantize:
                    "Krea2 SVDQuant W4A4 Loader (svdq) or the stock UNETLoader (w4a4/int8/fp8).")
 
     def run(self, source_model, format, rank, rank_alloc, refine_iters, groupsize, variant,
-            output_name, overwrite):
+            output_name, overwrite, act_stats=""):
         src = folder_paths.get_full_path_or_raise("diffusion_models", source_model)
 
         # `rank` always carries a value from the widget, so "was it set?" cannot be inferred
@@ -128,13 +147,25 @@ class Krea2SVDQuantQuantize:
         # erroring, which is the friendlier reading of a dropdown the user cannot un-set.
         fmt, rank = resolve_format(format, rank, rank_was_set=False)
 
+        # Same validation the CLI does for --act-stats: a typed path that silently did nothing
+        # would produce a checkpoint indistinguishable from a plain one.
+        stats_path = act_stats.strip() or None
+        if stats_path is not None:
+            if format != "svdq":
+                raise RuntimeError("act_stats only applies to format 'svdq': it weights the "
+                                   "low-rank branch, and the other formats have no branch.")
+            if not os.path.isabs(stats_path):
+                stats_path = os.path.join(folder_paths.get_output_directory(), stats_path)
+            if not os.path.isfile(stats_path):
+                raise RuntimeError("act_stats file not found: {}".format(stats_path))
+
         if output_name.strip():
             name = output_name.strip()
             if not name.endswith(".safetensors"):
                 name += ".safetensors"
             dst = os.path.join(os.path.dirname(src), name)
         else:
-            dst, note = derive_out_path(src, format, rank, variant, rank_alloc)
+            dst, note = derive_out_path(src, format, rank, variant, rank_alloc, stats_path)
             if note:
                 logging.info("[krea2-svdquant] %s", note)
 
@@ -165,11 +196,12 @@ class Krea2SVDQuantQuantize:
             pbar.update_absolute(done, total)
 
         logging.info("[krea2-svdquant] quantizing %s -> %s (format %s, rank %s/%s, "
-                     "refine_iters %s)", src, dst, fmt, rank, rank_alloc,
-                     refine_iters if rank else 0)
+                     "refine_iters %s, act_stats %s)", src, dst, fmt, rank, rank_alloc,
+                     refine_iters if rank else 0, stats_path or "none")
         summary = convert(src, dst, fmt, groupsize, "cuda", rank, refine_iters,
                           variant=variant, progress_cb=progress,
-                          rank_alloc=rank_alloc if rank else "uniform")
+                          rank_alloc=rank_alloc if rank else "uniform",
+                          act_stats=stats_path)
 
         hint = SAMPLER_HINTS.get(variant)
         loader = ("Krea2 SVDQuant W4A4 Loader" if rank else "the stock UNETLoader")

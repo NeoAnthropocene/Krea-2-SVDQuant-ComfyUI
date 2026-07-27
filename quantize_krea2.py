@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import importlib.util
 import json
 import math
 import os
@@ -50,11 +51,14 @@ import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 
-def _find_comfyui_root() -> str:
+def _find_comfyui_root() -> str | None:
     """Locate the ComfyUI root so `comfy.*` imports work regardless of cwd.
 
     Preference order: $COMFYUI_PATH, then walking up from this file (this script
-    lives in ComfyUI/custom_nodes/<pkg>/, so comfy/ is two levels up), then cwd.
+    lives in ComfyUI/custom_nodes/<pkg>/, so comfy/ is two levels up). None if
+    neither resolves -- deliberately *not* cwd. This module is imported by the
+    Quantize node inside ComfyUI's own process, and putting cwd at sys.path[0]
+    there lets any file in the working directory shadow a real import.
     """
     env = os.environ.get("COMFYUI_PATH")
     if env and os.path.isdir(os.path.join(env, "comfy")):
@@ -63,19 +67,32 @@ def _find_comfyui_root() -> str:
     candidate = os.path.abspath(os.path.join(here, "..", ".."))
     if os.path.isdir(os.path.join(candidate, "comfy")):
         return candidate
-    return "."
+    return None
 
 
-sys.path.insert(0, _find_comfyui_root())
+# Running inside ComfyUI, `comfy` already imports and the path needs no help.
+if importlib.util.find_spec("comfy") is None:
+    _root = _find_comfyui_root()
+    if _root is not None:
+        sys.path.insert(0, _root)
 
-from comfy.quant_ops import QUANT_ALGOS, get_layout_class  # noqa: E402
+# Guarded because __init__.py imports this module transitively: an unguarded failure
+# here would deregister every node in the pack, including Env Check, whose whole job is
+# diagnosing a broken quantization backend. Degrade to "no formats available" instead.
+QUANT_UNAVAILABLE = ""
+try:
+    from comfy.quant_ops import QUANT_ALGOS, get_layout_class  # noqa: E402
+except Exception as exc:  # pragma: no cover - depends on the ComfyUI build
+    QUANT_ALGOS = {}
+    get_layout_class = None
+    QUANT_UNAVAILABLE = "{}: {}".format(type(exc).__name__, exc)
 
 _QUANT_SUFFIXES = ("attn.wq", "attn.wk", "attn.wv", "attn.gate", "attn.wo",
                    "mlp.gate", "mlp.up", "mlp.down")
 
 
 # Checkpoints ship either bare ("blocks.0...") or prefixed ("model.diffusion_model.blocks.0...").
-_PREFIXES = ("model.diffusion_model.", "diffusion_model.", "")
+LAYER_PREFIXES = ("model.diffusion_model.", "diffusion_model.", "")
 
 # Formats we know how to reconstruct back to BF16 from disk alone. FP8 storage is one
 # byte per element with no packing or pre-rotation, so `qdata * scale` recovers the
@@ -85,15 +102,22 @@ _PREFIXES = ("model.diffusion_model.", "diffusion_model.", "")
 # in/out feature counts from the live nn.Linear, which isn't recoverable from the
 # checkpoint alone, so those are rejected instead.
 _DEQUANTIZABLE_FORMATS = ("float8_e4m3fn", "float8_e5m2")
-_UNSCALED_FP8_DTYPES = ("F8_E4M3", "F8_E5M2")
 
 
-def detect_prefix(keys) -> str:
-    """Return the prefix the transformer blocks live under, or raise if not found."""
-    for prefix in _PREFIXES:
+def detect_prefix(keys, default: str | None = None) -> str:
+    """Return the prefix the transformer blocks live under.
+
+    Raises `RuntimeError` if no prefix matches and no `default` was given. Not
+    `SystemExit`: that is a `BaseException`, and `convert()` runs inside ComfyUI's
+    executor via the Quantize node, where a BaseException escapes error handling
+    entirely. `main()` catches RuntimeError and prints it as a clean CLI line.
+    """
+    for prefix in LAYER_PREFIXES:
         if any(k.startswith("{}blocks.".format(prefix)) for k in keys):
             return prefix
-    raise SystemExit(
+    if default is not None:
+        return default
+    raise RuntimeError(
         "Could not find transformer blocks in this checkpoint. Expected keys like\n"
         "  blocks.0.attn.wq.weight  or  model.diffusion_model.blocks.0.attn.wq.weight\n"
         "This does not look like a Krea 2 diffusion model."
@@ -114,7 +138,7 @@ def check_requantizable(handle, keys, prefix: str) -> None:
         conf = json.loads(bytes(handle.get_tensor(key).tolist()))
         fmt = conf.get("format")
         if fmt not in _DEQUANTIZABLE_FORMATS:
-            raise SystemExit(
+            raise RuntimeError(
                 "Layer {} is already quantized as '{}'. Only FP8-quantized layers can be "
                 "automatically reconstructed and re-quantized; for INT8/W4A4 sources, use "
                 "the original BF16 (or FP16) release of the model instead.".format(layer, fmt)
@@ -429,8 +453,6 @@ def conf_tensor(conf: dict) -> torch.Tensor:
 
 def load_act_stats(path: str) -> dict[str, torch.Tensor]:
     """Read the file the capture nodes write: {layer name: per-input-channel RMS}."""
-    from safetensors import safe_open
-
     stats = {}
     with safe_open(path, framework="pt", device="cpu") as handle:
         for key in handle.keys():
@@ -438,6 +460,42 @@ def load_act_stats(path: str) -> dict[str, torch.Tensor]:
     if not stats:
         raise RuntimeError("{} contains no activation statistics".format(path))
     return stats
+
+
+def check_act_stats_coverage(stats: dict, keys, prefix: str, ranks: dict) -> None:
+    """Fail before any GPU work if the statistics don't cover every layer that will branch.
+
+    Partial statistics are the quiet-wrongness case: the covered layers would get an
+    activation-aware split and the rest a plain one, producing a checkpoint that is neither,
+    and no measurement of it would mean anything.
+
+    Deliberately key-only. Which layers branch depends on `is_target` plus a positive
+    `rank_for_leaf`, both of which read the layer *name*; the one weight-dependent step in
+    the loop (`min(wanted, min(w.shape))`) can only lower a rank, never raise a zero above
+    it, so this pre-pass sees exactly the set the loop will branch. Doing it here instead of
+    after the loop turns a ~6 minute mistake into a two-second one.
+    """
+    covered, missing = 0, []
+    for key in keys:
+        if not key.endswith(".weight"):
+            continue
+        layer = key[: -len(".weight")]
+        if not is_target(layer, prefix):
+            continue
+        if rank_for_leaf(ranks, leaf_name(layer, prefix)) <= 0:
+            continue
+        if stats.get(layer[len(prefix):] if prefix else layer) is None:
+            missing.append(layer)
+        else:
+            covered += 1
+    if missing:
+        raise RuntimeError(
+            "activation stats cover {} of {} branched layers; {} are missing, e.g. {}.\n"
+            "The capture run did not see every layer -- usually because sampling was "
+            "interrupted, or the statistics came from a different model. Re-capture rather "
+            "than building a checkpoint that is activation-aware in some layers and not "
+            "others.".format(covered, covered + len(missing), len(missing),
+                             ", ".join(missing[:3])))
 
 
 def convert(src: str, dst: str, fmt: str, groupsize: int, device: str = "cuda", rank: int = 0,
@@ -463,14 +521,14 @@ def convert(src: str, dst: str, fmt: str, groupsize: int, device: str = "cuda", 
     used_ranks: set[int] = set()
     clamped: dict[str, int] = {}
     stats = load_act_stats(act_stats) if act_stats else {}
-    stats_used = 0
-    stats_missing: list[str] = []
     t0 = time.time()
 
     with safe_open(src, framework="pt", device="cpu") as handle:
         keys = list(handle.keys())
         prefix = detect_prefix(keys)
         check_requantizable(handle, keys, prefix)
+        if stats:
+            check_act_stats_coverage(stats, keys, prefix, ranks)
 
         # Companion keys (old scales/markers) for target layers get regenerated fresh
         # when we process the ".weight" key below -- skip the stale copies on disk,
@@ -501,12 +559,9 @@ def convert(src: str, dst: str, fmt: str, groupsize: int, device: str = "cuda", 
                     if leaf_rank > 0:
                         # Stats are keyed by module path (`blocks.0.attn.wq`); checkpoint
                         # keys may carry a prefix, so strip it to look them up.
+                        # Coverage was already proven complete before the loop started, so
+                        # a None here cannot happen for a branched layer.
                         act = stats.get(layer[len(prefix):] if prefix else layer)
-                        if stats:
-                            if act is None:
-                                stats_missing.append(layer)
-                            else:
-                                stats_used += 1
                         split = svdquant_split(w, leaf_rank, fmt, groupsize, refine_iters,
                                                act_rms=act)
                         if split is None:
@@ -555,18 +610,6 @@ def convert(src: str, dst: str, fmt: str, groupsize: int, device: str = "cuda", 
             .format(prefix, ", ".join(sorted(_QUANT_SUFFIXES)),
                     ", ".join(sorted(observed_leaves)) or "none")
         )
-
-    # Partial statistics are the quiet-wrongness case this file hard-fails on elsewhere: the
-    # covered layers would get an activation-aware split and the rest a plain one, producing a
-    # checkpoint that is neither, and no measurement of it would mean anything.
-    if stats and stats_missing:
-        raise RuntimeError(
-            "activation stats cover {} of {} branched layers; {} are missing, e.g. {}.\n"
-            "The capture run did not see every layer -- usually because sampling was "
-            "interrupted, or the statistics came from a different model. Re-capture rather "
-            "than building a checkpoint that is activation-aware in some layers and not "
-            "others.".format(stats_used, stats_used + len(stats_missing), len(stats_missing),
-                             ", ".join(stats_missing[:3])))
 
     # A leaf can only be clamped when the allocation asked for more rank than the weight is
     # wide, which means part of the budget went unspent and the file is *smaller* than the

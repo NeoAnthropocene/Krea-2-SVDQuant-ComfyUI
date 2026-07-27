@@ -23,41 +23,18 @@ import comfy.sd
 import comfy.utils
 import folder_paths
 
-from .svdquant_diag import _CATEGORY, log_dispatch
+from .quantize_krea2 import detect_prefix
+from .svdquant_diag import BUF_L1, BUF_L2, _CATEGORY, branch_factors, log_dispatch  # noqa: F401
 
-_L1 = ".svdq_l1"
-_L2 = ".svdq_l2"
-
-# Buffer names, chosen to match the on-disk keys exactly: a buffer called ``svdq_l1`` on
-# ``blocks.0.attn.wq`` produces the state-dict key ``blocks.0.attn.wq.svdq_l1``, which is
-# byte-identical to what quantize_krea2.py writes. So a model re-saved out of ComfyUI
-# round-trips straight back into this loader.
-_BUF_L1 = "svdq_l1"
-_BUF_L2 = "svdq_l2"
-
-# Checkpoints ship either bare ("blocks.0...") or prefixed ("model.diffusion_model.blocks.0...").
-# `comfy.sd.load_diffusion_model_state_dict` strips this prefix internally when it builds the
-# module tree, but we walk that tree ourselves to attach branches, so we have to strip it too.
-_LAYER_PREFIXES = ("model.diffusion_model.", "diffusion_model.", "")
-
-
-def _detect_layer_prefix(keys) -> str:
-    for prefix in _LAYER_PREFIXES:
-        if any(k.startswith("{}blocks.".format(prefix)) for k in keys):
-            return prefix
-    return ""
+# The checkpoint keys are the buffer names with a dot in front -- derived rather than
+# retyped, because the two being identical is the property the round-trip depends on.
+_L1 = "." + BUF_L1
+_L2 = "." + BUF_L2
 
 
 def has_branch(module: torch.nn.Module) -> bool:
     """True once this module carries a low-rank branch (i.e. it is a quantized linear)."""
-    return _BUF_L1 in getattr(module, "_buffers", {})
-
-
-def branch_factors(module: torch.nn.Module):
-    """The (l1, l2) pair attached to a module, or None."""
-    bufs = getattr(module, "_buffers", {})
-    l1, l2 = bufs.get(_BUF_L1), bufs.get(_BUF_L2)
-    return None if l1 is None or l2 is None else (l1, l2)
+    return BUF_L1 in getattr(module, "_buffers", {})
 
 
 def add_low_rank(y: torch.Tensor, x: torch.Tensor, l1: torch.Tensor, l2: torch.Tensor):
@@ -95,7 +72,7 @@ def _publish_in_state_dict(module: torch.nn.Module) -> None:
 
     def state_dict(*args, destination=None, prefix="", **kwargs):
         sd = inner(*args, destination=destination, prefix=prefix, **kwargs)
-        for name in (_BUF_L1, _BUF_L2):
+        for name in (BUF_L1, BUF_L2):
             buf = module._buffers.get(name)
             if buf is not None:
                 sd["{}{}".format(prefix, name)] = buf
@@ -131,8 +108,8 @@ def attach_branch(module: torch.nn.Module, l1: torch.Tensor, l2: torch.Tensor,
 
     if scale != 1.0:
         l2 = l2 * scale
-    module.register_buffer(_BUF_L1, l1.contiguous(), persistent=True)
-    module.register_buffer(_BUF_L2, l2.contiguous(), persistent=True)
+    module.register_buffer(BUF_L1, l1.contiguous(), persistent=True)
+    module.register_buffer(BUF_L2, l2.contiguous(), persistent=True)
     _publish_in_state_dict(module)
 
     original = module.forward
@@ -197,7 +174,11 @@ def _shield_from_dynamo(module: torch.nn.Module) -> None:
 def load_svdquant_w4a4(path: str, model_options: dict | None = None,
                        compile_safe: bool = True):
     sd, metadata = comfy.utils.load_torch_file(path, return_metadata=True)
-    layer_prefix = _detect_layer_prefix(sd.keys())
+    # `comfy.sd.load_diffusion_model_state_dict` strips this prefix internally when it builds
+    # the module tree, but we walk that tree ourselves to attach branches, so we strip it too.
+    # `default=""` rather than raising: a loader must not blow up on a checkpoint with no
+    # blocks, and the "found no branches" error below says far more about what went wrong.
+    layer_prefix = detect_prefix(sd.keys(), default="")
 
     branches: dict[str, dict[str, torch.Tensor]] = {}
     for key in list(sd.keys()):

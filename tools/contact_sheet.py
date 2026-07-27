@@ -79,10 +79,17 @@ def main() -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--output-dir", required=True,
                     help="the ComfyUI output directory (reads its fb/ subfolder)")
-    ap.add_argument("--arm", default=None, choices=["base", "lora"],
+    ap.add_argument("--arm", default=None, choices=sorted(fb.ARM_LORA),
                     help="default: one set of sheets per arm present")
     ap.add_argument("--cell", type=int, default=640, help="tile size in px")
     ap.add_argument("--dest", default=None, help="default: <output-dir>/fb/sheets")
+    ap.add_argument("--optimize", action="store_true",
+                    help="slower PNG encode, roughly 20%% smaller")
+    # A 7-column sheet is ~4000x1200 px. As PNG that is ~5.7 MB each, so 32 of them is 184 MB
+    # of repository -- JPEG at q90 is ~20x smaller and the artifacts are nowhere near the
+    # scale of the differences these sheets exist to show.
+    ap.add_argument("--jpeg", type=int, default=None, metavar="QUALITY",
+                    help="write .jpg at this quality instead of .png (90 is a good default)")
     args = ap.parse_args()
 
     out_root = os.path.join(args.output_dir, fb.SUBDIR)
@@ -96,9 +103,12 @@ def main() -> int:
     arms = [args.arm] if args.arm else sorted({a for a, _ in images})
     written = 0
     for arm in arms:
-        ckpts = sorted(c for a, c in images if a == arm)
-        # Reference first, then whatever order the rest come in -- a moving anchor makes
-        # side-by-side comparison much harder than it needs to be.
+        present = {c for a, c in images if a == arm}
+        # Reference first, then fb.CHECKPOINTS order -- that is the accuracy ladder
+        # (no branch, then rising rank), so the sheet reads left to right. Alphabetical
+        # would put r128 before r16, and a moving anchor makes comparison much harder.
+        ckpts = [c for c in fb.CHECKPOINTS if c in present]
+        ckpts += sorted(present - set(ckpts))
         if fb.REFERENCE in ckpts:
             ckpts = [fb.REFERENCE] + [c for c in ckpts if c != fb.REFERENCE]
 
@@ -118,8 +128,12 @@ def main() -> int:
                         cells[(ckpt, seed)] = path
             sheet = build_sheet(cells, ckpts, sorted(seeds), args.cell,
                                 "{}  [{}]".format(pid, arm))
-            path = os.path.join(dest, "sheet_{}_{}.png".format(arm, pid))
-            sheet.save(path)
+            ext = "jpg" if args.jpeg else "png"
+            path = os.path.join(dest, "sheet_{}_{}.{}".format(arm, pid, ext))
+            if args.jpeg:
+                sheet.save(path, quality=args.jpeg, optimize=True, subsampling=0)
+            else:
+                sheet.save(path, optimize=args.optimize)
             written += 1
             print("wrote {}".format(path))
 
