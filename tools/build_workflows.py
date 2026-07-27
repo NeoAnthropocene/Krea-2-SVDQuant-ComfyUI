@@ -13,7 +13,9 @@ ComfyUI has two JSON dialects and they are not interchangeable.
 
 The repo used to ship only API format while the README told people to drag the file in, so
 every new user's first experience was a pile of untitled nodes stacked on the origin. Both
-dialects are emitted now: ``*_api.json`` for scripting, the plain name for the editor.
+dialects come out of this script now -- ``*_api.json`` for scripting, the plain name for the
+editor -- from one graph definition, so they cannot drift apart. They previously could, and
+did: the committed API files carried titles the generator had never produced.
 
 Positions are computed from a column/row grid rather than written by hand, so adding a node
 does not mean renumbering everything below it.
@@ -51,13 +53,25 @@ class Graph:
         self._next_node = 1
         self._next_link = 1
         self._slots = {}   # node_id -> {"in": {name: idx}, "out": {name: idx}}
+        self._api = {}     # node_id -> what the API dialect needs about that node
 
     def add(self, class_type, col, row, inputs=None, outputs=None, widgets=None,
-            title=None, colour=None, size=None, order=None):
+            title=None, colour=None, size=None, api=True):
+        """`widgets` is a list of (input_name, value).
+
+        The name is what the API dialect needs and the UI dialect ignores; `None` marks a
+        UI-only widget (`control_after_generate` has no API input). Keeping them as pairs is
+        what lets one graph definition emit both dialects, instead of a hand-written API file
+        drifting away from the generator -- which is exactly what had happened.
+
+        `api=False` drops the node from the API output: Notes and the optional Diagnostics
+        node are editor furniture with nothing to execute.
+        """
         nid = self._next_node
         self._next_node += 1
         inputs = inputs or []
         outputs = outputs or []
+        widgets = widgets or []
         self._slots[nid] = {
             "in": {name: i for i, (name, _) in enumerate(inputs)},
             "out": {name: i for i, (name, _) in enumerate(outputs)},
@@ -68,19 +82,21 @@ class Graph:
             "pos": [60 + col * COL, 60 + row * ROW],
             "size": size or [380, 100],
             "flags": {},
-            "order": self._next_node - 2 if order is None else order,
+            "order": self._next_node - 2,
             "mode": 0,
             "inputs": [{"name": n, "type": t, "link": None} for n, t in inputs],
             "outputs": [{"name": n, "type": t, "links": [], "slot_index": i}
                         for i, (n, t) in enumerate(outputs)],
             "properties": {"Node name for S&R": class_type},
-            "widgets_values": widgets if widgets is not None else [],
+            "widgets_values": [v for _name, v in widgets],
         }
         if title:
             node["title"] = title
         if colour:
             node["color"], node["bgcolor"] = colour
         self.nodes.append(node)
+        self._api[nid] = {"class_type": class_type, "title": title, "api": api,
+                          "widgets": [(n, v) for n, v in widgets if n is not None]}
         return nid
 
     def link(self, src_node, src_name, dst_node, dst_name):
@@ -99,8 +115,8 @@ class Graph:
 
     def note(self, text, col, row, size=(400, 260), title="READ ME"):
         """A built-in Note node. Its text lives in widgets_values[0]."""
-        return self.add("Note", col, row, widgets=[text], title=title, colour=YELLOW,
-                        size=list(size))
+        return self.add("Note", col, row, widgets=[(None, text)], title=title, colour=YELLOW,
+                        size=list(size), api=False)
 
     def group(self, title, bounding, colour="#3f789e"):
         return {"title": title, "bounding": list(bounding), "color": colour,
@@ -119,6 +135,34 @@ class Graph:
             "extra": {},
             "version": 0.4,
         }
+
+    def serialize_api(self):
+        """The same graph in API dialect: {"1": {"class_type", "inputs", "_meta"}, ...}.
+
+        Ids are reassigned sequentially over the executable nodes, so dropping the Note (which
+        is always added first) leaves the remaining nodes numbered from 1 with no gaps.
+        """
+        keep = [n["id"] for n in self.nodes if self._api[n["id"]]["api"]]
+        renum = {old: str(i + 1) for i, old in enumerate(keep)}
+
+        # dst_node -> {input_name: [src_id, src_slot]}
+        wired: dict[int, dict] = {}
+        for _lid, src, src_slot, dst, dst_slot, _type in self.links:
+            if src not in renum or dst not in renum:
+                continue
+            name = next(n for n, i in self._slots[dst]["in"].items() if i == dst_slot)
+            wired.setdefault(dst, {})[name] = [renum[src], src_slot]
+
+        out = {}
+        for old in keep:
+            meta = self._api[old]
+            inputs = {name: value for name, value in meta["widgets"]}
+            inputs.update(wired.get(old, {}))
+            entry = {"class_type": meta["class_type"], "inputs": inputs}
+            if meta["title"]:
+                entry["_meta"] = {"title": meta["title"]}
+            out[renum[old]] = entry
+        return out
 
 
 TURBO_NOTE = """KREA 2 TURBO - SVDQuant W4A4
@@ -190,44 +234,48 @@ def build_turbo():
 
     loader = g.add("Krea2SVDQuantW4A4Loader", 1, 0,
                    outputs=[("MODEL", "MODEL"), ("STRING", "STRING")],
-                   widgets=["Krea2-Turbo-SVDQuant-W4A4-rank64.safetensors"],
+                   widgets=[("model_name", "Krea2-Turbo-SVDQuant-W4A4-rank64.safetensors")],
                    title="Krea2 SVDQuant W4A4 Loader", colour=TEAL, size=[400, 120])
     clip = g.add("CLIPLoader", 1, 1,
                  outputs=[("CLIP", "CLIP")],
-                 widgets=["qwen3vl_4b_fp8_scaled.safetensors", "krea2", "default"],
+                 widgets=[("clip_name", "qwen3vl_4b_fp8_scaled.safetensors"), ("type", "krea2"),
+                          ("device", "default")],
                  title="Text encoder (Qwen3-VL 4B)", colour=TEAL, size=[400, 120])
     vae = g.add("VAELoader", 1, 2, outputs=[("VAE", "VAE")],
-                widgets=["qwen_image_vae.safetensors"], title="VAE", colour=TEAL,
+                widgets=[("vae_name", "qwen_image_vae.safetensors")], title="VAE", colour=TEAL,
                 size=[400, 80])
 
     pos = g.add("CLIPTextEncode", 2, 0, inputs=[("clip", "CLIP")],
-                outputs=[("CONDITIONING", "CONDITIONING")], widgets=[PROMPT],
+                outputs=[("CONDITIONING", "CONDITIONING")], widgets=[("text", PROMPT)],
                 title="Prompt", colour=GREEN, size=[400, 220])
     neg = g.add("ConditioningZeroOut", 2, 1.4, inputs=[("conditioning", "CONDITIONING")],
                 outputs=[("CONDITIONING", "CONDITIONING")],
                 title="Negative (zeroed - required at cfg 1.0)", colour=GREEN,
                 size=[400, 60])
     latent = g.add("EmptySD3LatentImage", 2, 2.2, outputs=[("LATENT", "LATENT")],
-                   widgets=[1024, 1024, 1], title="Latent 1024x1024", colour=GREEN,
+                   widgets=[("width", 1024), ("height", 1024), ("batch_size", 1)],
+                   title="Latent 1024x1024", colour=GREEN,
                    size=[400, 120])
 
     sampler = g.add("KSampler", 3, 0,
                     inputs=[("model", "MODEL"), ("positive", "CONDITIONING"),
                             ("negative", "CONDITIONING"), ("latent_image", "LATENT")],
                     outputs=[("LATENT", "LATENT")],
-                    widgets=[987654321, "randomize", 8, 1.0, "euler", "simple", 1.0],
+                    widgets=[("seed", 987654321), (None, "randomize"), ("steps", 8), ("cfg", 1.0),
+                             ("sampler_name", "euler"), ("scheduler", "simple"),
+                             ("denoise", 1.0)],
                     title="KSampler - 8 steps, cfg 1.0", colour=PURPLE, size=[400, 280])
     decode = g.add("VAEDecode", 4, 0, inputs=[("samples", "LATENT"), ("vae", "VAE")],
                    outputs=[("IMAGE", "IMAGE")], title="VAE Decode", colour=PURPLE,
                    size=[300, 60])
     save = g.add("SaveImage", 4, 0.7, inputs=[("images", "IMAGE")],
-                 widgets=["krea2_turbo_svdq"], title="Save", colour=PURPLE, size=[400, 300])
+                 widgets=[("filename_prefix", "krea2_turbo_svdq")], title="Save", colour=PURPLE, size=[400, 300])
 
     diag = g.add("Krea2SVDQuantDiagnostics", 3, 2.4, inputs=[("model", "MODEL")],
                  outputs=[("MODEL", "MODEL"), ("STRING", "STRING")],
-                 widgets=["dispatch", 4096],
+                 widgets=[("mode", "dispatch"), ("tokens", 4096)],
                  title="Diagnostics (optional - run if slow)", colour=YELLOW,
-                 size=[400, 130])
+                 size=[400, 130], api=False)
 
     g.link(loader, "MODEL", sampler, "model")
     g.link(clip, "CLIP", pos, "clip")
@@ -245,7 +293,7 @@ def build_turbo():
         g.group("Prompt", (940, 20, 420, 620)),
         g.group("Sample", (1360, 20, 420, 640), colour="#8a4"),
     ]
-    return g.serialize(groups)
+    return g.serialize(groups), g.serialize_api()
 
 
 def build_base():
@@ -254,37 +302,41 @@ def build_base():
 
     loader = g.add("Krea2SVDQuantW4A4Loader", 1, 0,
                    outputs=[("MODEL", "MODEL"), ("STRING", "STRING")],
-                   widgets=["Krea2-Base-SVDQuant-W4A4-rank64.safetensors"],
+                   widgets=[("model_name", "Krea2-Base-SVDQuant-W4A4-rank64.safetensors")],
                    title="Krea2 SVDQuant W4A4 Loader (base)", colour=TEAL, size=[400, 120])
     clip = g.add("CLIPLoader", 1, 1, outputs=[("CLIP", "CLIP")],
-                 widgets=["qwen3vl_4b_fp8_scaled.safetensors", "krea2", "default"],
+                 widgets=[("clip_name", "qwen3vl_4b_fp8_scaled.safetensors"), ("type", "krea2"),
+                          ("device", "default")],
                  title="Text encoder (Qwen3-VL 4B)", colour=TEAL, size=[400, 120])
     vae = g.add("VAELoader", 1, 2, outputs=[("VAE", "VAE")],
-                widgets=["qwen_image_vae.safetensors"], title="VAE", colour=TEAL,
+                widgets=[("vae_name", "qwen_image_vae.safetensors")], title="VAE", colour=TEAL,
                 size=[400, 80])
 
     pos = g.add("CLIPTextEncode", 2, 0, inputs=[("clip", "CLIP")],
-                outputs=[("CONDITIONING", "CONDITIONING")], widgets=[PROMPT],
+                outputs=[("CONDITIONING", "CONDITIONING")], widgets=[("text", PROMPT)],
                 title="Positive prompt", colour=GREEN, size=[400, 200])
     neg = g.add("CLIPTextEncode", 2, 1.3, inputs=[("clip", "CLIP")],
-                outputs=[("CONDITIONING", "CONDITIONING")], widgets=[NEGATIVE],
+                outputs=[("CONDITIONING", "CONDITIONING")], widgets=[("text", NEGATIVE)],
                 title="Negative prompt (base uses real CFG)", colour=GREEN,
                 size=[400, 140])
     latent = g.add("EmptySD3LatentImage", 2, 2.3, outputs=[("LATENT", "LATENT")],
-                   widgets=[1024, 1024, 1], title="Latent 1024x1024", colour=GREEN,
+                   widgets=[("width", 1024), ("height", 1024), ("batch_size", 1)],
+                   title="Latent 1024x1024", colour=GREEN,
                    size=[400, 120])
 
     sampler = g.add("KSampler", 3, 0,
                     inputs=[("model", "MODEL"), ("positive", "CONDITIONING"),
                             ("negative", "CONDITIONING"), ("latent_image", "LATENT")],
                     outputs=[("LATENT", "LATENT")],
-                    widgets=[987654321, "randomize", 50, 3.5, "euler", "simple", 1.0],
+                    widgets=[("seed", 987654321), (None, "randomize"), ("steps", 50), ("cfg", 3.5),
+                             ("sampler_name", "euler"), ("scheduler", "simple"),
+                             ("denoise", 1.0)],
                     title="KSampler - 50 steps, cfg 3.5", colour=PURPLE, size=[400, 280])
     decode = g.add("VAEDecode", 4, 0, inputs=[("samples", "LATENT"), ("vae", "VAE")],
                    outputs=[("IMAGE", "IMAGE")], title="VAE Decode", colour=PURPLE,
                    size=[300, 60])
     save = g.add("SaveImage", 4, 0.7, inputs=[("images", "IMAGE")],
-                 widgets=["krea2_base_svdq"], title="Save", colour=PURPLE, size=[400, 300])
+                 widgets=[("filename_prefix", "krea2_base_svdq")], title="Save", colour=PURPLE, size=[400, 300])
 
     g.link(loader, "MODEL", sampler, "model")
     g.link(clip, "CLIP", pos, "clip")
@@ -301,19 +353,27 @@ def build_base():
         g.group("Prompt", (940, 20, 420, 620)),
         g.group("Sample", (1360, 20, 420, 640), colour="#8a4"),
     ]
-    return g.serialize(groups)
+    return g.serialize(groups), g.serialize_api()
+
+
+def _write(path, payload):
+    with open(path, "w", encoding="utf-8", newline="\n") as fh:
+        json.dump(payload, fh, indent=2, ensure_ascii=False)
+        fh.write("\n")
 
 
 def main():
     os.makedirs(OUT_DIR, exist_ok=True)
-    for name, graph in (("krea2_turbo_svdquant_w4a4_t2i", build_turbo()),
-                        ("krea2_base_svdquant_w4a4_t2i", build_base())):
-        path = os.path.join(OUT_DIR, name + ".json")
-        with open(path, "w", encoding="utf-8", newline="\n") as fh:
-            json.dump(graph, fh, indent=2, ensure_ascii=False)
-            fh.write("\n")
+    for name, build in (("krea2_turbo_svdquant_w4a4_t2i", build_turbo),
+                        ("krea2_base_svdquant_w4a4_t2i", build_base)):
+        graph, api = build()
+        ui_path = os.path.join(OUT_DIR, name + ".json")
+        api_path = os.path.join(OUT_DIR, name + "_api.json")
+        _write(ui_path, graph)
+        _write(api_path, api)
         print("wrote {}  ({} nodes, {} links)".format(
-            path, len(graph["nodes"]), len(graph["links"])))
+            ui_path, len(graph["nodes"]), len(graph["links"])))
+        print("wrote {}  ({} nodes)".format(api_path, len(api)))
 
 
 if __name__ == "__main__":

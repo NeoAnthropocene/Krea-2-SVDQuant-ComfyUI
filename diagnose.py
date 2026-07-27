@@ -49,7 +49,8 @@ def main() -> int:
                         help="path to a --format svdq checkpoint (or a name under "
                              "models/diffusion_models)")
     parser.add_argument("--mode", default="dispatch",
-                        choices=["dispatch", "env", "bench", "profile", "all"])
+                        choices=["dispatch", "env", "bench", "profile", "all"],
+                        help="'all' runs env, dispatch, bench and profile in that order")
     parser.add_argument("--tokens", type=int, default=None,
                         help="sequence length to probe with; 4096 = 1024x1024")
     parser.add_argument("--no-load", action="store_true",
@@ -78,7 +79,10 @@ def main() -> int:
     print("loading {} ...".format(path), flush=True)
     patcher = loader.load_svdquant_w4a4(path)
 
-    modes = ["env", "dispatch", "bench"] if args.mode == "all" else [args.mode]
+    # Driven off REPORTS rather than a hand-written list, which had drifted: `profile` was
+    # added to the choices and to REPORTS but never to `all`, so `--mode all` quietly meant
+    # "all but the profile table" and nobody pasting its output would have known.
+    modes = list(diag.REPORTS) if args.mode == "all" else [args.mode]
     for mode in modes:
         print()
         print(diag.run_report(patcher, mode, tokens), flush=True)

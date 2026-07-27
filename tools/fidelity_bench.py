@@ -3,8 +3,8 @@
     python tools/fidelity_bench.py generate --output-dir <ComfyUI/output> [--seeds 4]
     python tools/fidelity_bench.py score    --output-dir <ComfyUI/output>
 
-Why this exists rather than `tools/pixel_metrics.py` alone. That script scores one seed per
-prompt and reports each checkpoint's *marginal* mean. Two things go wrong with that:
+Why this exists. The measurement it replaced scored one seed per prompt and reported each
+checkpoint's *marginal* mean. Two things go wrong with that:
 
 * **One seed cannot resolve the differences we care about.** Re-analysing its own 130-pair
   output as paired differences: `rank256 vs nolowrank` is a clean t=-4.73 (10/10 prompts),
@@ -54,6 +54,8 @@ sys.path.insert(0, HERE)
 
 # The metric implementations are shared rather than reimplemented -- two copies of SSIM in
 # one repo is two chances to have a different window or a different epsilon.
+import torch  # noqa: E402
+
 import pixel_metrics  # noqa: E402
 
 SUBDIR = "fb"
@@ -90,9 +92,9 @@ ARM_LORA = {
 }
 
 # Loader choice is a property of the file, so it lives with the file rather than being
-# guessed from the name at call time. `quantized` drives the *LoRA* node choice: the stock
-# loader cannot patch a quantized weight and silently skips those blocks, which is the whole
-# reason this repo ships its own LoRA node.
+# guessed from the name at call time. `quantized` drives the *LoRA* node choice: applying a
+# LoRA to a quantized weight through the stock path means dequantize -> add -> requantize,
+# which re-quantizes the LoRA delta to 4 bits, so quantized files go through this repo's node.
 CHECKPOINTS = {
     "bf16":      {"file": "turbo.safetensors",                            "loader": "unet", "quantized": False},
     "nolowrank": {"file": "Krea2-Turbo-W4A4-convrot.safetensors",         "loader": "unet", "quantized": True},
@@ -105,9 +107,9 @@ CHECKPOINTS = {
     "r256aa":    {"file": "Krea2-Turbo-SVDQuant-W4A4-rank256-actaware.safetensors", "loader": "svdq", "quantized": True},
 }
 
-# The repo's established prompt set (the same ids BENCHMARKS.md and pixel_metrics.csv use),
-# kept verbatim so new numbers stay comparable with the old ones.
-PROMPTS = [
+# The repo's established prompt set (the same ids BENCHMARKS.md uses), kept verbatim so new
+# numbers stay comparable with the old ones.
+PROMPTS_OBJECTS = [
     ("01_dense_text", "A rain-soaked neon diner sign at night, below it a handwritten chalkboard menu with three lines of text reading 'SOUP $4 / PIE $6 / COFFEE $2', reflections on wet asphalt, cinematic"),
     ("02_curved_text", "Close-up of a person holding a paper coffee cup with large bold curved text 'STAY WARM' printed around the cup, soft morning light, shallow depth of field"),
     ("03_hands_detail", "A violinist's hands mid-performance, fingers pressed on the strings, bow in motion with visible blur, studio lighting, extreme close-up, photorealistic"),
@@ -134,7 +136,7 @@ PROMPTS_PEOPLE = [
     ("16_group_selfie", "Four friends of different ethnicities crowded around a restaurant table taking a group selfie, one holding the phone at arm's length, another leaning in making a peace sign, plates of pasta and half-full wine glasses on the table, warm indoor lighting, natural candid expressions"),
 ]
 
-PROMPTS = PROMPTS + PROMPTS_PEOPLE
+PROMPTS = PROMPTS_OBJECTS + PROMPTS_PEOPLE
 
 # Fixed rather than random so a re-run reproduces the same dataset. The first is the seed the
 # older single-seed benchmarks used, which keeps those results inside this one.
@@ -312,7 +314,6 @@ def score(args) -> int:
         import lpips
     except ImportError:
         raise SystemExit("pip install lpips")
-    import torch
 
     out_root = os.path.join(args.output_dir, SUBDIR)
     images = index(out_root)
@@ -333,7 +334,7 @@ def score(args) -> int:
     # touches a tile mosaic but rewrites skin and hair -- so they are separable.
     if args.group:
         wanted = {p for p, _ in (PROMPTS_PEOPLE if args.group == "people"
-                                 else PROMPTS[:len(PROMPTS) - len(PROMPTS_PEOPLE)])}
+                                 else PROMPTS_OBJECTS)}
         images = {k: {c: p for c, p in cells.items() if c[0] in wanted}
                   for k, cells in images.items()}
         images = {k: cells for k, cells in images.items() if cells}
@@ -352,7 +353,7 @@ def score(args) -> int:
     def load(path):
         if path in cache:
             return cache[path]
-        tensor = pixel_metrics._load(path, device)
+        tensor = pixel_metrics.load_image(path, device)
         if path in ref_paths:
             cache[path] = tensor
         return tensor
@@ -440,21 +441,26 @@ def score(args) -> int:
                 label, st["mean"], st["se"], st["t"], st["a_wins"], st["n"], mark))
             summary.append(dict(arm=arm, a=a_ck, b=b_ck, **st))
 
-    # The reason the LoRA arm exists: same checkpoint, same cells, LoRA vs no LoRA. A
+    # The reason the LoRA arms exist: same checkpoint, same cells, LoRA vs no LoRA. A
     # positive mean means the LoRA made that checkpoint drift further from its own
-    # reference, i.e. LoRAs amplify quantization error.
-    both = sorted({c for a, c in lpips_by if a == "lora"} & {c for a, c in lpips_by if a == "base"})
-    if both:
-        print("\nLoRA amplification (lora - base, same checkpoint/prompt/seed)")
+    # reference, i.e. LoRAs amplify quantization error. One block per LoRA arm present --
+    # this used to be hardcoded to "lora", so extra arms were generated and then silently
+    # left out of the analysis.
+    base_ckpts = {c for a, c in lpips_by if a == "base"}
+    for arm in sorted({a for a, _ in lpips_by} - {"base"}):
+        both = sorted({c for a, c in lpips_by if a == arm} & base_ckpts)
+        if not both:
+            continue
+        print("\nLoRA amplification ({} - base, same checkpoint/prompt/seed)".format(arm))
         print("{:<40} {:>9} {:>8} {:>7} {:>9}".format("checkpoint", "mean", "se", "t", "worse"))
         for ckpt in both:
-            st = paired(lpips_by[("lora", ckpt)], lpips_by[("base", ckpt)])
+            st = paired(lpips_by[(arm, ckpt)], lpips_by[("base", ckpt)])
             if st is None:
                 continue
             mark = "  ***" if abs(st["t"]) > 3 else ("  *" if abs(st["t"]) > 2 else "")
             print("{:<40} {:>+9.4f} {:>8.4f} {:>7.2f} {:>5}/{}{}".format(
                 ckpt, st["mean"], st["se"], st["t"], st["n"] - st["a_wins"], st["n"], mark))
-            summary.append(dict(arm="amplification", a=ckpt, b=ckpt, **st))
+            summary.append(dict(arm="amplification:" + arm, a=ckpt, b=ckpt, **st))
 
     json_path = os.path.splitext(out_csv)[0] + "_summary.json"
     with open(json_path, "w", encoding="utf-8") as fh:
@@ -498,7 +504,9 @@ def main() -> int:
 
     sc = sub.choices["score"]
     sc.add_argument("--out", default=None)
-    sc.add_argument("--device", default="cuda")
+    # Scoring is LPIPS over already-rendered PNGs -- it has no GPU requirement of its own,
+    # so it must not fail on a machine that only has the images.
+    sc.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     sc.add_argument("--seeds", type=int, default=None,
                     help="analyse only the first N fixed seeds, so a half-finished generate "
                          "does not make the cell grid ragged")

@@ -202,8 +202,10 @@ class Krea2SVDQuantLoraLoader:
     FUNCTION = "load_lora"
     CATEGORY = _CATEGORY
     TITLE = "Krea2 SVDQuant LoRA Loader"
-    DESCRIPTION = ("Applies a LoRA to a Krea2 W4A4 quantized model. The standard LoRA "
-                   "loader silently skips the quantized layers on these models.")
+    DESCRIPTION = ("Applies a LoRA to a Krea2 W4A4 quantized model as a parallel low-rank "
+                   "branch, leaving the 4-bit weight untouched. The stock loader has to "
+                   "dequantize, add and requantize, which puts the LoRA delta through 4-bit "
+                   "quantization along with the weight.")
 
     def load_lora(self, model, lora_name, strength):
         if strength == 0:
