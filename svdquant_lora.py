@@ -2,8 +2,8 @@
 
 A normal `LoraLoaderModelOnly` cannot patch these quantized layers correctly: ComfyUI
 applies a LoRA by adding `down @ up` onto a module's `.weight`, but here `.weight` is a
-`QuantizedTensor` -- patching it that way would mean dequantize -> add -> requantize,
-losing the format, or in practice just silently missing the layer.
+`QuantizedTensor` -- patching it that way means dequantize -> add -> requantize, which
+throws the 4-bit format away and re-quantizes the LoRA delta along with it.
 
 Krea2 LoRAs (ai-toolkit) target both kinds of layer:
 
@@ -43,7 +43,13 @@ from .svdquant_w4a4 import add_low_rank, has_branch
 
 _DOWN_SUFFIXES = (".lora_A.weight", ".lora_down.weight", ".lora.down.weight")
 _UP_SUFFIXES = (".lora_B.weight", ".lora_up.weight", ".lora.up.weight")
-_PREFIX = "diffusion_model."
+# ComfyUI's native prefix, plus the diffusers one some trainers write in front of the very
+# same native module names (`transformer.blocks.N.attn.wq`). That hybrid matches nothing in
+# `comfy/lora.py` -- its `transformer.` entries are keyed on *diffusers* module names
+# (`transformer.transformer_blocks.N.attn.to_q`) -- so the stock loader logs "lora key not
+# loaded" for every key and applies nothing at all. Accepting it here is the difference
+# between the LoRA working and it silently doing nothing.
+_PREFIXES = ("diffusion_model.", "transformer.")
 
 # Reloading a 300 MB LoRA off disk on every graph execution is pure latency when the
 # usual edit is a strength slider. Keyed on mtime+size so editing the file invalidates.
@@ -76,8 +82,9 @@ def _split_lora(lora_sd, quant_layers: set[str]):
         for suffix in suffixes:
             if key.endswith(suffix):
                 name = key[: -len(suffix)]
-                if name.startswith(_PREFIX):
-                    name = name[len(_PREFIX):]
+                for prefix in _PREFIXES:
+                    if name.startswith(prefix):
+                        return name[len(prefix):]
                 return name
         return None
 
@@ -183,9 +190,10 @@ class Krea2SVDQuantLoraLoader:
                                "checkpoint with convrot_w4a4 quantized blocks.",
                 }),
                 "lora_name": (folder_paths.get_filename_list("loras"), {
-                    "tooltip": "A Krea2 LoRA. Targets 'diffusion_model.blocks.N.{attn,mlp}.*' "
-                               "for the quantized blocks; anything else it carries "
-                               "(txtfusion etc.) goes through ComfyUI's normal path.",
+                    "tooltip": "A Krea2 LoRA. Targets 'blocks.N.{attn,mlp}.*' under either "
+                               "prefix ('diffusion_model.' or 'transformer.') for the "
+                               "quantized blocks; anything else it carries (txtfusion "
+                               "etc.) goes through ComfyUI's normal path.",
                 }),
                 "strength": ("FLOAT", {
                     "default": 1.0, "min": -10.0, "max": 10.0, "step": 0.01,
@@ -271,7 +279,7 @@ class Krea2SVDQuantLoraLoader:
                 "{} matched {} non-quantized layers but none of the {} quantized ones. "
                 "ComfyUI's normal LoRA path cannot patch a quantized weight, so the blocks "
                 "would silently go unchanged. Check that the LoRA targets "
-                "'diffusion_model.blocks.N.{{attn,mlp}}.*'.".format(
+                "'[diffusion_model.|transformer.]blocks.N.{{attn,mlp}}.*'.".format(
                     lora_name, normal, len(quant_layers))
             )
 

@@ -90,6 +90,38 @@ One gap remains and it is upstream, not here: `QuantizedTensor.nbytes` reports o
 packed weight, so the W4A4 `weight_scale` (~3 MB/layer) is still invisible to ComfyUI's
 accounting for *any* w4a4 checkpoint, branch or no branch.
 
+## "no layer of X matched this model" (and the same LoRA "works" on the stock loader)
+
+The LoRA's key prefix. Krea2 LoRAs come with either `diffusion_model.blocks.N.attn.wq...`
+(ComfyUI native) or `transformer.blocks.N.attn.wq...` — a diffusers prefix in front of native
+module names, which some PEFT-based extraction tools write. ComfyUI does accept a
+`transformer.` prefix for Krea2, but only with *diffusers* module names
+(`transformer.transformer_blocks.N.attn.to_q`), so the hybrid form matches nothing in
+`comfy/lora.py`:
+
+```
+krea2_raw_to_turbo_r256.safetensors  (transformer.blocks.N...)  -> stock loader: 0 patches
+same file, keys renamed to diffusion_model.                     -> stock loader: 224 patches
+```
+
+Zero patches means the stock loader is not failing — it is applying nothing at all and
+generating as if no LoRA were loaded. That is why one of these can look like it "works
+without the SVDQuant node": it does not, it is a silent no-op. This loader hard-fails on the
+same file instead, which is the error above.
+
+Both prefixes are accepted now, so the LoRA loads as-is. If you also want it usable from the
+stock `LoraLoaderModelOnly`, rename the keys in the file itself:
+
+```python
+from safetensors import safe_open
+from safetensors.torch import save_file
+
+with safe_open("in.safetensors", "pt") as f:
+    meta = dict(f.metadata() or {})
+    sd = {k.replace("transformer.", "diffusion_model.", 1): f.get_tensor(k) for k in f.keys()}
+save_file(sd, "out.safetensors", metadata=meta)
+```
+
 ## Sage attention: `OutOfResources` or a broken image with krea2edit's `ref_boost`
 
 Fixed, and it was never about the LoRA. `comfyui-krea2edit` turns `ref_boost` into an
