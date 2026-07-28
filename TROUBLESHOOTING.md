@@ -90,6 +90,30 @@ One gap remains and it is upstream, not here: `QuantizedTensor.nbytes` reports o
 packed weight, so the W4A4 `weight_scale` (~3 MB/layer) is still invisible to ComfyUI's
 accounting for *any* w4a4 checkpoint, branch or no branch.
 
+## Sage attention: `OutOfResources` or a broken image with krea2edit's `ref_boost`
+
+Fixed, and it was never about the LoRA. `comfyui-krea2edit` turns `ref_boost` into an
+*additive float* attention bias, and a float mask is the one input sage's kernels do not
+take well:
+
+* `sageattn_qk_int8_pv_fp16_triton` stages the mask tile through shared memory on top of the
+  K/V pipeline. At head_dim 128 it asks for 139276 bytes against the 101376 an Ampere or Ada
+  SM offers, so the launch dies with
+  `triton.runtime.errors.OutOfResources: out of resource: shared memory`.
+* the CUDA kernels launch, but the masked result drifts ~50x further from a BF16 reference
+  than the same call unmasked — over 224 layers that is the black or scrambled image.
+
+Boolean masks are fine on both, and so is the ordinary no-mask text-to-image step, which is
+why this only ever showed up on the edit workflow. The loader now installs a guard that sends
+float-mask attention calls to ComfyUI's stock attention and leaves everything else on sage:
+you keep the speedup on every normal block and pay full price only on the biased ones. The
+console logs `float attention mask -> stock attention` once per run when it fires.
+
+Merging the LoRA into the checkpoint appeared to fix it only because that comparison also
+dropped the `ref_boost` bias; the quantized model and its LoRA branch are not involved. If
+you load a plain `--format w4a4` / `int8` checkpoint through the stock `UNETLoader`, the
+guard is not installed — use the SVDQuant loader, or turn sage off for edit workflows.
+
 ## A re-saved checkpoint logs "left over keys in diffusion model"
 
 Expected. Saving the model out of ComfyUI now includes the `svdq_l1` / `svdq_l2` keys, which

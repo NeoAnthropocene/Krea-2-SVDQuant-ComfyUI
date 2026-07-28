@@ -24,6 +24,7 @@ import comfy.utils
 import folder_paths
 
 from .quantize_krea2 import detect_prefix
+from .sage_mask_guard import install_mask_guard
 from .svdquant_diag import BUF_L1, BUF_L2, _CATEGORY, branch_factors, log_dispatch  # noqa: F401
 
 # The checkpoint keys are the buffer names with a dot in front -- derived rather than
@@ -238,6 +239,8 @@ def load_svdquant_w4a4(path: str, model_options: dict | None = None,
     # The branch buffers were registered after the patcher computed (and cached) its size,
     # so drop the cache and let `model_size()` re-derive it from the state dict.
     patcher.size = 0
+
+    install_mask_guard(patcher)
 
     # Metadata is a newer addition; checkpoints published before it still load, with the
     # rank recovered from the factor shape exactly as before. The shapes are the ground
