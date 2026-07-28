@@ -1,6 +1,6 @@
 """Multi-seed, paired fidelity benchmark against a BF16 reference -- with and without a LoRA.
 
-    python tools/fidelity_bench.py generate --output-dir <ComfyUI/output> [--seeds 4]
+    python tools/fidelity_bench.py generate --output-dir <ComfyUI/output> [--variant base] [--seeds 4]
     python tools/fidelity_bench.py score    --output-dir <ComfyUI/output>
 
 Why this exists. The measurement it replaced scored one seed per prompt and reported each
@@ -61,8 +61,10 @@ import pixel_metrics  # noqa: E402
 SUBDIR = "fb"
 REFERENCE = "bf16"
 
-# 8 steps / cfg 1.0 / euler+simple is what Krea 2 Turbo is distilled for; changing any of
-# them changes what "the same image" means and invalidates comparison with earlier runs.
+# 8 steps / cfg 1.0 / euler+simple is what Krea 2 Turbo is distilled for; the base model is
+# not distilled and wants 50 steps at cfg 3.5 (SAMPLER_HINTS in quantize_krea2.py). Changing
+# either set changes what "the same image" means and invalidates comparison with earlier runs,
+# so they are picked by `--variant` rather than edited.
 STEPS = 8
 CFG = 1.0
 SAMPLER = "euler"
@@ -95,7 +97,7 @@ ARM_LORA = {
 # guessed from the name at call time. `quantized` drives the *LoRA* node choice: applying a
 # LoRA to a quantized weight through the stock path means dequantize -> add -> requantize,
 # which re-quantizes the LoRA delta to 4 bits, so quantized files go through this repo's node.
-CHECKPOINTS = {
+CHECKPOINTS_TURBO = {
     "bf16":      {"file": "turbo.safetensors",                            "loader": "unet", "quantized": False},
     "nolowrank": {"file": "Krea2-Turbo-W4A4-convrot.safetensors",         "loader": "unet", "quantized": True},
     "r16":       {"file": "Krea2-Turbo-SVDQuant-W4A4-rank16.safetensors", "loader": "svdq", "quantized": True},
@@ -106,6 +108,47 @@ CHECKPOINTS = {
     # weighted by measured activation RMS instead of plain weight magnitude.
     "r256aa":    {"file": "Krea2-Turbo-SVDQuant-W4A4-rank256-actaware.safetensors", "loader": "svdq", "quantized": True},
 }
+
+CHECKPOINTS_BASE = {
+    "bf16":      {"file": "raw.safetensors",                             "loader": "unet", "quantized": False},
+    "nolowrank": {"file": "Krea2-Base-W4A4-convrot.safetensors",         "loader": "unet", "quantized": True},
+    "r16":       {"file": "Krea2-Base-SVDQuant-W4A4-rank16.safetensors", "loader": "svdq", "quantized": True},
+    "r64":       {"file": "Krea2-Base-SVDQuant-W4A4-rank64.safetensors", "loader": "svdq", "quantized": True},
+    "r128":      {"file": "Krea2-Base-SVDQuant-W4A4-rank128.safetensors","loader": "svdq", "quantized": True},
+    "r256":      {"file": "Krea2-Base-SVDQuant-W4A4-rank256.safetensors","loader": "svdq", "quantized": True},
+    "r256aa":    {"file": "Krea2-Base-SVDQuant-W4A4-rank256-actaware.safetensors", "loader": "svdq", "quantized": True},
+}
+
+# Renders go to a per-variant subfolder so a base run cannot be scored against turbo images:
+# the scorer indexes a directory, and two variants in one directory would silently pair
+# 8-step turbo renders with 50-step base ones.
+# The negative matters only above cfg 1.0. Turbo runs at cfg 1.0, where the negative branch
+# is never evaluated, so a zeroed-out conditioning costs nothing there. The base model runs at
+# cfg 3.5 and CFG then pushes *away* from whatever the negative is -- away from a zeroed
+# conditioning means away from nothing, which comes out as grainy, over-contrasted garbage.
+# `None` = ConditioningZeroOut; a string = a real encoded negative, as the shipped base
+# workflow uses.
+NEGATIVE_BASE = "blurry, low resolution, jpeg artifacts, watermark, deformed, extra limbs"
+
+VARIANTS = {
+    "turbo": {"steps": 8,  "cfg": 1.0, "subdir": "fb",      "checkpoints": CHECKPOINTS_TURBO,
+              "negative": None},
+    "base":  {"steps": 50, "cfg": 3.5, "subdir": "fb_base", "checkpoints": CHECKPOINTS_BASE,
+              "negative": NEGATIVE_BASE},
+}
+
+CHECKPOINTS = CHECKPOINTS_TURBO
+NEGATIVE = None
+
+
+def select_variant(name: str) -> None:
+    """Point the module's sampler settings and checkpoint table at one model variant."""
+    global STEPS, CFG, SUBDIR, CHECKPOINTS, NEGATIVE
+    spec = VARIANTS[name]
+    STEPS, CFG = spec["steps"], spec["cfg"]
+    SUBDIR, CHECKPOINTS = spec["subdir"], spec["checkpoints"]
+    NEGATIVE = spec["negative"]
+
 
 # The repo's established prompt set (the same ids BENCHMARKS.md uses), kept verbatim so new
 # numbers stay comparable with the old ones.
@@ -165,7 +208,9 @@ def build_graph(ckpt: str, prompt: str, seed: int, arm: str, prefix: str) -> dic
               "inputs": {"clip_name": CLIP_NAME, "type": "krea2", "device": "default"}},
         "3": {"class_type": "VAELoader", "inputs": {"vae_name": VAE_NAME}},
         "4": {"class_type": "CLIPTextEncode", "inputs": {"text": prompt, "clip": ["2", 0]}},
-        "5": {"class_type": "ConditioningZeroOut", "inputs": {"conditioning": ["4", 0]}},
+        "5": ({"class_type": "ConditioningZeroOut", "inputs": {"conditioning": ["4", 0]}}
+              if NEGATIVE is None else
+              {"class_type": "CLIPTextEncode", "inputs": {"text": NEGATIVE, "clip": ["2", 0]}}),
         "6": {"class_type": "EmptySD3LatentImage",
               "inputs": {"width": WIDTH, "height": HEIGHT, "batch_size": 1}},
         "7": {"class_type": "KSampler",
@@ -464,9 +509,11 @@ def score(args) -> int:
 
     json_path = os.path.splitext(out_csv)[0] + "_summary.json"
     with open(json_path, "w", encoding="utf-8") as fh:
-        json.dump({"reference": REFERENCE, "reference_self_lpips": self_lpips,
+        json.dump({"reference": REFERENCE, "variant": args.variant,
+                   "reference_self_lpips": self_lpips,
                    "reseed_floor": floors, "paired": summary,
-                   "settings": {"steps": STEPS, "cfg": CFG, "sampler": SAMPLER,
+                   "settings": {"steps": STEPS, "cfg": CFG, "negative": NEGATIVE,
+                                "sampler": SAMPLER,
                                 "scheduler": SCHEDULER, "width": WIDTH, "height": HEIGHT,
                                 "loras": ARM_LORA, "lora_strength": LORA_STRENGTH}},
                   fh, indent=2)
@@ -484,7 +531,10 @@ def main() -> int:
     for name in ("generate", "score"):
         p = sub.add_parser(name)
         p.add_argument("--output-dir", required=True,
-                       help="the ComfyUI output directory (renders land in its fb/ subfolder)")
+                       help="the ComfyUI output directory (renders land in a subfolder of it)")
+        p.add_argument("--variant", default="turbo", choices=sorted(VARIANTS),
+                       help="which model family to bench: turbo (8 steps, cfg 1.0) or base "
+                            "(50 steps, cfg 3.5). Must match between generate and score")
 
     gen = sub.choices["generate"]
     gen.add_argument("--server", default="http://127.0.0.1:8188")
@@ -498,8 +548,9 @@ def main() -> int:
                           "count when the set has grown: a count silently changes meaning "
                           "when prompts are appended")
     gen.add_argument("--arms", nargs="+", default=["base"], choices=sorted(ARM_LORA))
-    gen.add_argument("--checkpoints", nargs="+", default=sorted(CHECKPOINTS),
-                     choices=sorted(CHECKPOINTS))
+    # No `choices=` here: the legal set depends on --variant, which argparse has not read
+    # yet. Validated against the selected variant below instead.
+    gen.add_argument("--checkpoints", nargs="+", default=None)
     gen.add_argument("--timeout", type=int, default=900)
 
     sc = sub.choices["score"]
@@ -514,7 +565,14 @@ def main() -> int:
                     help="restrict to one prompt group (01-10 vs 11-16)")
 
     args = ap.parse_args()
+    select_variant(args.variant)
     if args.stage == "generate":
+        if args.checkpoints is None:
+            args.checkpoints = sorted(CHECKPOINTS)
+        unknown = [c for c in args.checkpoints if c not in CHECKPOINTS]
+        if unknown:
+            raise SystemExit("unknown checkpoint(s) for variant {}: {} (have: {})".format(
+                args.variant, ", ".join(unknown), ", ".join(sorted(CHECKPOINTS))))
         if REFERENCE not in args.checkpoints:
             print("note: {!r} is not in --checkpoints, so nothing will be scorable until it "
                   "is generated".format(REFERENCE))
