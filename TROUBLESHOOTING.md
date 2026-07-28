@@ -141,6 +141,40 @@ float-mask attention calls to ComfyUI's stock attention and leaves everything el
 you keep the speedup on every normal block and pay full price only on the biased ones. The
 console logs `float attention mask -> stock attention` once per run when it fires.
 
+## Random all-black frames with sage `auto` / `..._fp16_cuda`
+
+Also fixed, and it is a sage kernel bug, not a quantization one. `sageattn_qk_int8_pv_fp16_cuda`
+returns NaN for sequences shorter than one K/V block. Standalone, no ComfyUI, same inputs on
+every call, RTX 3090, head_dim 128, bf16 and fp16 alike:
+
+```
+B=64  H=20  N=4..48    ->  7-10 of 10 calls non-finite
+B=64  H=20  N=63..128  ->  0 of 10
+B=592 H=20  N=12 / 32  ->  0-3 of 20, and it flips between processes
+triton, every shape    ->  0 of 20
+```
+
+Krea2's `txtfusion` layerwise blocks attend over **12 tokens**, so every sampling step rolls
+these dice, and a single NaN there poisons the latent: a completely black frame. `auto` picks
+this kernel on sm80/86/87 (`sageattention/core.py`), which is why "auto" and "cuda fp16" were
+the two settings people reported black images on.
+
+The intermittency is what made it look like a LoRA or SVDQuant problem: the same graph is
+clean on one model load and black on the next, and it survives across runs until the model is
+reloaded. It is neither. Measured before the fix, 768px edit workflow, cold load each time:
+roughly one black frame in three or four. After it: 10 of 10 clean, and byte-identical
+outputs run to run.
+
+The guard now routes any attention shorter than one K/V block to stock attention. Sage has
+nothing to win on a 12-token attention, so this costs no measurable speed, and it applies
+regardless of which sage kernel is selected. Console logs
+`attention shorter than one K/V block ... -> stock attention` once per run.
+
+One more thing worth knowing about `auto`: on sm80/86/87 its dispatch calls the kernel
+*without* forwarding `attn_mask` at all, so krea2edit's `ref_boost` would be silently ignored
+even when the output is not black. Prefer `sageattn_qk_int8_pv_fp16_triton` if you want the
+bias honoured on the blocks the guard does not intercept.
+
 Merging the LoRA into the checkpoint appeared to fix it only because that comparison also
 dropped the `ref_boost` bias; the quantized model and its LoRA branch are not involved. If
 you load a plain `--format w4a4` / `int8` checkpoint through the stock `UNETLoader`, the
