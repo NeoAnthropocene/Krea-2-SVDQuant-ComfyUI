@@ -139,23 +139,29 @@ def _supports_bypass(adapter) -> bool:
     return (type(adapter).h is not base.h) or (type(adapter).g is not base.g)
 
 
-def _staged(adapter, strength: float, x: torch.Tensor):
-    """The adapter with its tensors on x's device, without touching the shared original.
+def _bypass_runner(adapter, strength: float):
+    """`y -> g(y + h(x, y))` for one adapter, staged the way the low-rank branch is staged.
 
-    `h()` reads `self.weights` and `self.multiplier`, so a shallow copy carrying staged
-    weights is enough -- mutating the cached adapter would leak one layer's staging into
-    every other patcher holding the same object.
+    ComfyUI's own bypass hook parks adapter weights on the GPU at inject time "to avoid
+    per-forward transfers", and a LoKr `w2` (1536x1536) is far bigger than a rank-64 LoRA
+    factor, so caching the staged copy looked like the obvious win. Measured on a 3090 at
+    1024px it is worth nothing: 2.01 s/step cached against 2.02 s/step restaging every call.
+    The cost is the Kronecker math itself -- ~38.7 GMAC per layer, ~0.5 s across 224 layers,
+    which is the +0.66 s/step this path adds over a plain LoRA. So this keeps `cast_to` per
+    call like `add_low_rank` does, and ComfyUI's VRAM accounting keeps seeing the truth
+    instead of ~1 GB of adapter weights it does not know about.
 
-    Staging per call rather than parking the tensors on the GPU is the same bargain
-    `add_low_rank` makes: `cast_to` is free when they are already resident, and when they are
-    not, ComfyUI's VRAM accounting stays honest. It costs more here than it does for a plain
-    LoRA -- a LoKr `w2` is 1536x1536, ~4.5 MB per layer against a rank-64 factor's ~0.8 MB.
+    The shallow copy is because `h()` reads `self.weights`/`self.multiplier` and the adapter
+    object is shared with every other patcher holding the same cached LoRA.
     """
-    staged = copy.copy(adapter)
-    staged.weights = [comfy.model_management.cast_to(w, x.dtype, x.device)
-                      if torch.is_tensor(w) else w for w in adapter.weights]
-    staged.multiplier = strength
-    return staged
+    def run(y, x):
+        staged = copy.copy(adapter)
+        staged.weights = [comfy.model_management.cast_to(w, x.dtype, x.device)
+                          if torch.is_tensor(w) else w for w in adapter.weights]
+        staged.multiplier = strength
+        return staged.g(y + staged.h(x, y))
+
+    return run
 
 
 def _make_lora_forward(module, factors, adapters):
@@ -176,14 +182,14 @@ def _make_lora_forward(module, factors, adapters):
     """
     base = getattr(module, "_krea2_forward", None) or module.forward
     l1, l2 = factors if factors else (None, None)
+    runners = [_bypass_runner(adapter, strength) for adapter, strength in adapters]
 
     def forward(x, *args, **kwargs):
         y = base(x, *args, **kwargs)
         if l1 is not None:
             y = add_low_rank(y, x, l1, l2)
-        for adapter, strength in adapters:
-            staged = _staged(adapter, strength, x)
-            y = staged.g(y + staged.h(x, y))
+        for run in runners:
+            y = run(y, x)
         return y
 
     return forward

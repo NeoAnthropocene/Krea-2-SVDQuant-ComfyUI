@@ -103,7 +103,14 @@ knows every format and naming convention ComfyUI supports. From there:
 * **a `diff`/`set` patch, or anything with no bypass form** -> ComfyUI's normal path, with a
   warning, because that route rewrites the weight and requantizes the delta to 4 bits
 
-Two consequences worth knowing:
+**LoKr is not free at runtime.** Measured on a 3090, 1024x1024, 8 steps, on top of a plain
+LoRA: 1.34 s/step without it, 2.01 s/step with it. That is the Kronecker math, not the
+plumbing -- a `w2` of 1536x1536 across 4 groups is ~38.7 GMAC per layer, ~0.5 s over 224
+layers. Caching the adapter weights on the GPU instead of staging them per call was measured
+and changed nothing (2.01 vs 2.02 s/step), so the loader does not hold that memory. If your
+sampler evaluates the model twice per step (`res_2s` and friends), double the figure.
+
+Two more consequences worth knowing:
 
 **A LoRA that targets no quantized layer is no longer an error.** A txtfusion-only adapter
 (`diffusion_model.txtfusion.projector.diff`, for instance) is a legitimate thing to load; the
