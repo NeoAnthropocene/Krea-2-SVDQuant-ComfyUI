@@ -53,6 +53,40 @@ _LOKR_W2_SUFFIXES = (".lokr_w2", ".lokr_w2.weight", ".lokr_w2_a", ".lokr_w2_a.we
 # between the LoRA working and it silently doing nothing.
 _PREFIXES = ("diffusion_model.", "transformer.")
 
+_DIFFUSERS_NAME_MAP = [
+    ("transformer_blocks.", "blocks."),
+    (".attn.to_q", ".attn.wq"),
+    (".attn.to_k", ".attn.wk"),
+    (".attn.to_v", ".attn.wv"),
+    (".attn.to_out.0", ".attn.wo"),
+    (".attn.to_gate", ".attn.gate"),
+    (".ff.gate", ".mlp.gate"),
+    (".ff.up", ".mlp.up"),
+    (".ff.down", ".mlp.down"),
+]
+
+
+def _normalize_layer_name(name: str, quant_layers: set[str]) -> str:
+    for prefix in _PREFIXES:
+        if name.startswith(prefix):
+            name = name[len(prefix):]
+            break
+
+    if name in quant_layers:
+        return name
+
+    mapped = name
+    for old, new in _DIFFUSERS_NAME_MAP:
+        if old.startswith(".") or old.endswith("."):
+            if old in mapped:
+                mapped = mapped.replace(old, new)
+        else:
+            if mapped.startswith(old):
+                mapped = new + mapped[len(old):]
+
+    return mapped
+
+
 # Reloading a 300 MB LoRA off disk on every graph execution is pure latency when the
 # usual edit is a strength slider. Keyed on mtime+size so editing the file invalidates.
 _LORA_CACHE: OrderedDict[str, tuple[tuple, dict]] = OrderedDict()
@@ -83,11 +117,8 @@ def _split_lora(lora_sd, quant_layers: set[str]):
     def layer_of(key, suffixes):
         for suffix in suffixes:
             if key.endswith(suffix):
-                name = key[: -len(suffix)]
-                for prefix in _PREFIXES:
-                    if name.startswith(prefix):
-                        return name[len(prefix):]
-                return name
+                raw_name = key[: -len(suffix)]
+                return _normalize_layer_name(raw_name, quant_layers)
         return None
 
     for key in list(lora_sd.keys()):
