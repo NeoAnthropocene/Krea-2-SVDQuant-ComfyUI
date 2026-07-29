@@ -90,6 +90,96 @@ One gap remains and it is upstream, not here: `QuantizedTensor.nbytes` reports o
 packed weight, so the W4A4 `weight_scale` (~3 MB/layer) is still invisible to ComfyUI's
 accounting for *any* w4a4 checkpoint, branch or no branch.
 
+## "no layer of X matched this model" (and the same LoRA "works" on the stock loader)
+
+The LoRA's key prefix. Krea2 LoRAs come with either `diffusion_model.blocks.N.attn.wq...`
+(ComfyUI native) or `transformer.blocks.N.attn.wq...` — a diffusers prefix in front of native
+module names, which some PEFT-based extraction tools write. ComfyUI does accept a
+`transformer.` prefix for Krea2, but only with *diffusers* module names
+(`transformer.transformer_blocks.N.attn.to_q`), so the hybrid form matches nothing in
+`comfy/lora.py`:
+
+```
+krea2_raw_to_turbo_r256.safetensors  (transformer.blocks.N...)  -> stock loader: 0 patches
+same file, keys renamed to diffusion_model.                     -> stock loader: 224 patches
+```
+
+Zero patches means the stock loader is not failing — it is applying nothing at all and
+generating as if no LoRA were loaded. That is why one of these can look like it "works
+without the SVDQuant node": it does not, it is a silent no-op. This loader hard-fails on the
+same file instead, which is the error above.
+
+Both prefixes are accepted now, so the LoRA loads as-is. If you also want it usable from the
+stock `LoraLoaderModelOnly`, rename the keys in the file itself:
+
+```python
+from safetensors import safe_open
+from safetensors.torch import save_file
+
+with safe_open("in.safetensors", "pt") as f:
+    meta = dict(f.metadata() or {})
+    sd = {k.replace("transformer.", "diffusion_model.", 1): f.get_tensor(k) for k in f.keys()}
+save_file(sd, "out.safetensors", metadata=meta)
+```
+
+## Sage attention: `OutOfResources` or a broken image with krea2edit's `ref_boost`
+
+Fixed, and it was never about the LoRA. `comfyui-krea2edit` turns `ref_boost` into an
+*additive float* attention bias, and a float mask is the one input sage's kernels do not
+take well:
+
+* `sageattn_qk_int8_pv_fp16_triton` stages the mask tile through shared memory on top of the
+  K/V pipeline. At head_dim 128 it asks for 139276 bytes against the 101376 an Ampere or Ada
+  SM offers, so the launch dies with
+  `triton.runtime.errors.OutOfResources: out of resource: shared memory`.
+* the CUDA kernels launch, but the masked result drifts ~50x further from a BF16 reference
+  than the same call unmasked — over 224 layers that is the black or scrambled image.
+
+Boolean masks are fine on both, and so is the ordinary no-mask text-to-image step, which is
+why this only ever showed up on the edit workflow. The loader now installs a guard that sends
+float-mask attention calls to ComfyUI's stock attention and leaves everything else on sage:
+you keep the speedup on every normal block and pay full price only on the biased ones. The
+console logs `float attention mask -> stock attention` once per run when it fires.
+
+## Random all-black frames with sage `auto` / `..._fp16_cuda`
+
+Also fixed, and it is a sage kernel bug, not a quantization one. `sageattn_qk_int8_pv_fp16_cuda`
+returns NaN for sequences shorter than one K/V block. Standalone, no ComfyUI, same inputs on
+every call, RTX 3090, head_dim 128, bf16 and fp16 alike:
+
+```
+B=64  H=20  N=4..48    ->  7-10 of 10 calls non-finite
+B=64  H=20  N=63..128  ->  0 of 10
+B=592 H=20  N=12 / 32  ->  0-3 of 20, and it flips between processes
+triton, every shape    ->  0 of 20
+```
+
+Krea2's `txtfusion` layerwise blocks attend over **12 tokens**, so every sampling step rolls
+these dice, and a single NaN there poisons the latent: a completely black frame. `auto` picks
+this kernel on sm80/86/87 (`sageattention/core.py`), which is why "auto" and "cuda fp16" were
+the two settings people reported black images on.
+
+The intermittency is what made it look like a LoRA or SVDQuant problem: the same graph is
+clean on one model load and black on the next, and it survives across runs until the model is
+reloaded. It is neither. Measured before the fix, 768px edit workflow, cold load each time:
+roughly one black frame in three or four. After it: 10 of 10 clean, and byte-identical
+outputs run to run.
+
+The guard now routes any attention shorter than one K/V block to stock attention. Sage has
+nothing to win on a 12-token attention, so this costs no measurable speed, and it applies
+regardless of which sage kernel is selected. Console logs
+`attention shorter than one K/V block ... -> stock attention` once per run.
+
+One more thing worth knowing about `auto`: on sm80/86/87 its dispatch calls the kernel
+*without* forwarding `attn_mask` at all, so krea2edit's `ref_boost` would be silently ignored
+even when the output is not black. Prefer `sageattn_qk_int8_pv_fp16_triton` if you want the
+bias honoured on the blocks the guard does not intercept.
+
+Merging the LoRA into the checkpoint appeared to fix it only because that comparison also
+dropped the `ref_boost` bias; the quantized model and its LoRA branch are not involved. If
+you load a plain `--format w4a4` / `int8` checkpoint through the stock `UNETLoader`, the
+guard is not installed — use the SVDQuant loader, or turn sage off for edit workflows.
+
 ## A re-saved checkpoint logs "left over keys in diffusion model"
 
 Expected. Saving the model out of ComfyUI now includes the `svdq_l1` / `svdq_l2` keys, which

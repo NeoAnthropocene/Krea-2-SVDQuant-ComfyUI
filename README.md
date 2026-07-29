@@ -36,6 +36,7 @@ Everything lives under `checkpoints/` on Hugging Face.
 | `Krea2-Turbo-SVDQuant-W4A4-rank256.safetensors` | 256 | 9.10 GB | The same without the activation weighting |
 | `Krea2-Turbo-SVDQuant-W4A4-rank64.safetensors` | 64 | 7.90 GB | 1.2 GB smaller, and identical to rank 256 *if you never load a LoRA* |
 | `Krea2-Turbo-W4A4-noLowRank.safetensors` | — | 7.50 GB | Smallest and ~9% faster per step; loads with the stock **UNETLoader** |
+| `Krea2-Base-SVDQuant-W4A4-rank256-actaware.safetensors` | 256 | 9.10 GB | The **base** (non-distilled) model, not turbo. 50 steps, cfg 3.5, real negative prompt |
 | `checkpoints/legacy/` | 16, 128 | — | Superseded, kept because BENCHMARKS.md cites measurements from them |
 
 The `actaware` file is the same format, size and speed as plain rank 256 — the low-rank branch
@@ -44,6 +45,13 @@ uniform ([`--act-stats`](#activation-aware-branch---act-stats)). Without a LoRA 
 LPIPS-to-BF16 from 0.3378 to **0.2825** (t=4.68 over 32 paired cells); with a LoRA it measures
 no worse. There is no case where the plain build is the better pick. The calibration file it
 was built from is in `calibration/`, so the build is reproducible.
+
+The base file is the same recipe applied to `raw.safetensors`, built from its own calibration
+pass (`calibration/krea2_act_stats_base.safetensors`, 8 prompts on the BF16 base model at its
+own sampler settings). **It has not been through the paired benchmark yet** — the act-aware
+numbers below are turbo measurements and are not evidence about the base build. Treat it as
+"the base equivalent of the recommended turbo file", not as a measured improvement over
+`Krea2-Base-SVDQuant-W4A4-rank256`.
 
 **Rank only matters if you load LoRAs.** Without one, ranks 64 / 128 / 256 are statistically
 indistinguishable. With one, rank 256 wins clearly and rank 64 loses most of its advantage
