@@ -90,6 +90,32 @@ One gap remains and it is upstream, not here: `QuantizedTensor.nbytes` reports o
 packed weight, so the W4A4 `weight_scale` (~3 MB/layer) is still invisible to ComfyUI's
 accounting for *any* w4a4 checkpoint, branch or no branch.
 
+## LoKr / LoHa / OFT LoRAs, and adapters that touch no quantized layer
+
+Supported since the loader stopped parsing LoRAs itself. Parsing is now
+`comfy.lora.load_lora`, which returns one of ComfyUI's weight adapters per layer and already
+knows every format and naming convention ComfyUI supports. From there:
+
+* **plain up/down LoRA** -> folded into the low-rank branch, one pair of GEMMs for the whole
+  stack no matter how many LoRAs are chained
+* **LoKr, LoHa, OFT, GLoRA** -> ComfyUI's bypass contract `g(f(x) + h(x))`, which exists for
+  exactly this case ("designed for quantized models where weights may not be accessible")
+* **a `diff`/`set` patch, or anything with no bypass form** -> ComfyUI's normal path, with a
+  warning, because that route rewrites the weight and requantizes the delta to 4 bits
+
+Two consequences worth knowing:
+
+**A LoRA that targets no quantized layer is no longer an error.** A txtfusion-only adapter
+(`diffusion_model.txtfusion.projector.diff`, for instance) is a legitimate thing to load; the
+old guard refused it on the theory that ComfyUI could not patch quantized weights at all,
+which was measured and found false.
+
+**Alpha follows ComfyUI's rule, not a heuristic.** For LoKr the scale is `alpha / dim` only
+when `w1` or `w2` was rebuilt from an a/b pair; when both are full matrices the alpha is
+ignored. That matters because some trainers write a sentinel alpha -- one real file carries
+`9999220736.0` -- and dividing by a rank would either explode the activations or silence the
+LoRA entirely, depending on which way you got it wrong.
+
 ## "no layer of X matched this model" (and the same LoRA "works" on the stock loader)
 
 The LoRA's key prefix. Krea2 LoRAs come with either `diffusion_model.blocks.N.attn.wq...`

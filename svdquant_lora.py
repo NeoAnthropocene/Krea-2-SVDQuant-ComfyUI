@@ -15,6 +15,13 @@ parallel branch (mathematically identical for a linear layer: `(W + BA)x == Wx +
 so the quantized weight itself is never touched), and everything else is handed to
 ComfyUI's normal patching path.
 
+Parsing is ComfyUI's job, not ours: `comfy.lora.load_lora` returns a weight adapter per
+layer and already knows every format and naming convention it supports. Plain up/down LoRAs
+are folded into the branch above, one pair of GEMMs for the whole stack. Everything else --
+LoKr, LoHa, OFT -- runs through ComfyUI's bypass contract `g(f(x) + h(x))`, which is written
+for precisely this case: its docstring says "designed for quantized models where weights may
+not be accessible". Either way the 4-bit weight is read, never rewritten.
+
 The branch is installed through ``ModelPatcher.add_object_patch`` rather than by mutating
 the module. That is what makes the node behave like every other ComfyUI node: `clone()`
 shares the underlying `nn.Module`, so writing the LoRA onto the module directly would
@@ -28,6 +35,7 @@ scratch each time, so strengths can change without leftover state from a previou
 
 from __future__ import annotations
 
+import copy
 import logging
 import os
 from collections import OrderedDict
@@ -35,21 +43,16 @@ from collections import OrderedDict
 import torch
 
 import comfy.lora
+import comfy.model_management
 import comfy.utils
+import comfy.weight_adapter
 import folder_paths
 
 from .svdquant_diag import _CATEGORY, quantized_linears
 from .svdquant_w4a4 import add_low_rank, has_branch
 
-_DOWN_SUFFIXES = (".lora_A.weight", ".lora_down.weight", ".lora.down.weight")
-_UP_SUFFIXES = (".lora_B.weight", ".lora_up.weight", ".lora.up.weight")
-# ComfyUI's native prefix, plus the diffusers one some trainers write in front of the very
-# same native module names (`transformer.blocks.N.attn.wq`). That hybrid matches nothing in
-# `comfy/lora.py` -- its `transformer.` entries are keyed on *diffusers* module names
-# (`transformer.transformer_blocks.N.attn.to_q`) -- so the stock loader logs "lora key not
-# loaded" for every key and applies nothing at all. Accepting it here is the difference
-# between the LoRA working and it silently doing nothing.
-_PREFIXES = ("diffusion_model.", "transformer.")
+_PREFIX = "diffusion_model."
+_ALT_PREFIX = "transformer."
 
 # Reloading a 300 MB LoRA off disk on every graph execution is pure latency when the
 # usual edit is a strength slider. Keyed on mtime+size so editing the file invalidates.
@@ -73,39 +76,90 @@ def _load_lora_cached(path: str) -> dict:
     return sd
 
 
-def _split_lora(lora_sd, quant_layers: set[str]):
-    """Return ({layer: {down, up, alpha}}, leftover_state_dict)."""
-    pairs: dict[str, dict] = {}
-    consumed: set[str] = set()
+def _key_map(model):
+    """ComfyUI's LoRA-key to model-key map, plus the one naming it does not cover.
 
-    def layer_of(key, suffixes):
-        for suffix in suffixes:
-            if key.endswith(suffix):
-                name = key[: -len(suffix)]
-                for prefix in _PREFIXES:
-                    if name.startswith(prefix):
-                        return name[len(prefix):]
-                return name
+    `model_lora_keys_unet` already handles every format and every naming ComfyUI knows --
+    diffusers, lycoris, kohya -- so parsing is its job, not ours. The one gap is a diffusers
+    *prefix* in front of *native* module names (`transformer.blocks.N.attn.wq`), which some
+    PEFT-based extractions write: ComfyUI's `transformer.` entries are keyed on diffusers
+    module names (`transformer.transformer_blocks.N.attn.to_q`), so the hybrid matches
+    nothing and the LoRA silently does nothing. Aliasing the map rather than special-casing
+    the parser means the fix applies to every format, not just plain LoRA.
+    """
+    key_map = comfy.lora.model_lora_keys_unet(model, {})
+    for lora_key, model_key in list(key_map.items()):
+        if lora_key.startswith(_PREFIX):
+            key_map.setdefault(_ALT_PREFIX + lora_key[len(_PREFIX):], model_key)
+    return key_map
+
+
+def _layer_of(model_key: str, quant_layers: set[str]) -> str | None:
+    """`diffusion_model.blocks.0.attn.wq.weight` -> `blocks.0.attn.wq`, if it is quantized."""
+    if not model_key.startswith(_PREFIX) or not model_key.endswith(".weight"):
         return None
-
-    for key in list(lora_sd.keys()):
-        for suffixes, slot in ((_DOWN_SUFFIXES, "down"), (_UP_SUFFIXES, "up")):
-            name = layer_of(key, suffixes)
-            if name is not None and name in quant_layers:
-                pairs.setdefault(name, {})[slot] = lora_sd[key]
-                consumed.add(key)
-                alpha_key = key.rsplit(".lora", 1)[0] + ".alpha"
-                if alpha_key in lora_sd:
-                    pairs[name]["alpha"] = float(lora_sd[alpha_key].item())
-                    consumed.add(alpha_key)
-                break
-
-    leftover = {k: v for k, v in lora_sd.items() if k not in consumed}
-    return pairs, leftover
+    layer = model_key[len(_PREFIX):-len(".weight")]
+    return layer if layer in quant_layers else None
 
 
-def _make_lora_forward(module, l1: torch.Tensor, l2: torch.Tensor):
-    """A forward that is "quantized weight + svdq branch (if any) + this LoRA".
+def _plain_lora_factors(adapter, strength: float, device, dtype):
+    """(l1, l2) for a plain up/down LoRA, or None if this adapter is anything else.
+
+    Worth the special case: folded this way an N-LoRA stack costs one pair of GEMMs per step
+    (see `_stack_factors`), where the generic adapter path costs a pair *per adapter*. Every
+    ordinary Krea2 LoRA takes this route; the generic path is for the rest.
+    """
+    if not isinstance(adapter, comfy.weight_adapter.LoRAAdapter):
+        return None
+    up, down, alpha, mid, dora_scale = adapter.weights[:5]
+    reshape = adapter.weights[5] if len(adapter.weights) > 5 else None
+    # mid is a Tucker/conv core, dora_scale rescales the *base* weight's norm, reshape means
+    # the LoRA was trained against a differently-shaped weight. None of the three survive
+    # being folded into a parallel branch, so they go to the generic path instead.
+    if mid is not None or dora_scale is not None or reshape is not None or up.ndim != 2:
+        return None
+    # `if alpha` would treat a legitimate alpha of 0.0 as "no alpha" and silently run the
+    # layer at full strength instead of disabling it.
+    rank = int(down.shape[0])
+    mult = strength * (float(alpha) / rank if alpha is not None else 1.0)
+    l1 = up.to(device=device, dtype=dtype)
+    l2 = down.to(device=device, dtype=dtype) * mult
+    return l1.contiguous(), l2.contiguous()
+
+
+def _supports_bypass(adapter) -> bool:
+    """True when the adapter can run without touching the base weight.
+
+    ComfyUI's bypass contract is `bypass(f)(x) = g(f(x) + h(x))`, written for exactly our
+    situation -- its own docstring says "designed for quantized models where weights may not
+    be accessible". An adapter that overrides neither is one ComfyUI can only apply by
+    rewriting the weight, which for a QuantizedTensor means dequantize -> add -> requantize.
+    """
+    base = comfy.weight_adapter.WeightAdapterBase
+    return (type(adapter).h is not base.h) or (type(adapter).g is not base.g)
+
+
+def _staged(adapter, strength: float, x: torch.Tensor):
+    """The adapter with its tensors on x's device, without touching the shared original.
+
+    `h()` reads `self.weights` and `self.multiplier`, so a shallow copy carrying staged
+    weights is enough -- mutating the cached adapter would leak one layer's staging into
+    every other patcher holding the same object.
+
+    Staging per call rather than parking the tensors on the GPU is the same bargain
+    `add_low_rank` makes: `cast_to` is free when they are already resident, and when they are
+    not, ComfyUI's VRAM accounting stays honest. It costs more here than it does for a plain
+    LoRA -- a LoKr `w2` is 1536x1536, ~4.5 MB per layer against a rank-64 factor's ~0.8 MB.
+    """
+    staged = copy.copy(adapter)
+    staged.weights = [comfy.model_management.cast_to(w, x.dtype, x.device)
+                      if torch.is_tensor(w) else w for w in adapter.weights]
+    staged.multiplier = strength
+    return staged
+
+
+def _make_lora_forward(module, factors, adapters):
+    """A forward that is "quantized weight + svdq branch (if any) + this LoRA stack".
 
     Built on `module._krea2_forward` rather than `module.forward` so that it composes with
     the svdq branch but never with a previously installed LoRA patch -- each patcher owns
@@ -115,11 +169,22 @@ def _make_lora_forward(module, l1: torch.Tensor, l2: torch.Tensor):
     `_krea2_forward`; there the module's own forward already *is* "quantized weight", so it
     is the right base. Object patches are applied in `patch_model`, after this runs, so what
     we capture is the unpatched forward either way.
+
+    `factors` is the folded plain-LoRA branch (one pair of GEMMs for the whole stack);
+    `adapters` are everything else -- LoKr, LoHa, OFT -- run through ComfyUI's bypass
+    contract `g(f(x) + h(x))`, which never materialises a weight delta.
     """
     base = getattr(module, "_krea2_forward", None) or module.forward
+    l1, l2 = factors if factors else (None, None)
 
     def forward(x, *args, **kwargs):
-        return add_low_rank(base(x, *args, **kwargs), x, l1, l2)
+        y = base(x, *args, **kwargs)
+        if l1 is not None:
+            y = add_low_rank(y, x, l1, l2)
+        for adapter, strength in adapters:
+            staged = _staged(adapter, strength, x)
+            y = staged.g(y + staged.h(x, y))
+        return y
 
     return forward
 
@@ -139,45 +204,52 @@ def _stack_factors(factors: list[tuple[torch.Tensor, torch.Tensor]]):
 
 
 def collect_svdquant_lora(patcher, lora_sd, strength: float, quant_layers: set[str],
-                          device, dtype, into: dict, patch_leftover: bool = True):
-    """Accumulate this LoRA's quantized-layer factors into `into`; patch the rest normally.
+                          device, dtype, into_branch: dict, into_adapters: dict,
+                          patch_leftover: bool = True):
+    """Route one LoRA: quantized layers into `into_branch`/`into_adapters`, the rest normally.
 
     `patch_leftover=False` collects the quantized side only and leaves the non-quantized
     layers alone -- see `load_lora` for why the two sides of the stack are handled
     differently.
 
-    Returns the number of layers matched on each path.
+    Returns (quantized layers claimed, layers patched normally, how many of those normal
+    patches landed on a *quantized* weight -- which is the case worth complaining about).
     """
-    pairs, leftover = _split_lora(lora_sd, quant_layers)
+    loaded = comfy.lora.load_lora(lora_sd, _key_map(patcher.model), log_missing=False)
 
     applied = 0
-    for layer, parts in pairs.items():
-        if "down" not in parts or "up" not in parts:
+    leftover = {}
+    dequantizing = 0
+    for model_key, patch in loaded.items():
+        layer = _layer_of(model_key, quant_layers)
+        if layer is None:
+            leftover[model_key] = patch
             continue
-        rank = int(parts["down"].shape[0])
-        alpha = parts.get("alpha")
-        # `if alpha` would treat a legitimate alpha of 0.0 as "no alpha" and silently run the
-        # layer at full strength instead of disabling it.
-        mult = strength * (float(alpha) / rank if alpha is not None else 1.0)
-        l1 = parts["up"].to(device=device, dtype=dtype)
-        l2 = parts["down"].to(device=device, dtype=dtype) * mult
-        into.setdefault(layer, []).append((l1.contiguous(), l2.contiguous()))
+        factors = _plain_lora_factors(patch, strength, device, dtype)
+        if factors is not None:
+            into_branch.setdefault(layer, []).append(factors)
+        elif isinstance(patch, comfy.weight_adapter.WeightAdapterBase) and _supports_bypass(patch):
+            into_adapters.setdefault(layer, []).append((patch, strength))
+        else:
+            # A `diff`/`set`/`bias` patch, or an adapter with no bypass form. ComfyUI can
+            # still apply it, but only by rewriting the weight, so the LoRA delta goes
+            # through 4-bit quantization along with it.
+            leftover[model_key] = patch
+            dequantizing += 1
+            continue
         applied += 1
 
     if not patch_leftover:
-        return applied, 0
+        return applied, 0, 0
 
     # Everything the quantized layers did not claim (txtfusion, etc.) goes through
     # ComfyUI's normal LoRA path.
     patched_normally = 0
     if leftover:
-        key_map = comfy.lora.model_lora_keys_unet(patcher.model, {})
-        loaded = comfy.lora.load_lora(leftover, key_map, log_missing=False)
-        if loaded:
-            patcher.add_patches(loaded, strength)
-            patched_normally = len(loaded)
+        patcher.add_patches(leftover, strength)
+        patched_normally = len(leftover)
 
-    return applied, patched_normally
+    return applied, patched_normally, dequantizing
 
 
 class Krea2SVDQuantLoraLoader:
@@ -256,45 +328,50 @@ class Krea2SVDQuantLoraLoader:
         #   running at different strengths.
         #
         # So only the newest entry patches normally; earlier ones are already inherited.
-        collected: dict[str, list] = {}
-        quantized = normal = 0
+        branch: dict[str, list] = {}
+        adapters: dict[str, list] = {}
+        quantized = normal = dequantizing = 0
         newest = len(stack) - 1
         for i, (name, amount) in enumerate(stack):
             path = folder_paths.get_full_path_or_raise("loras", name)
-            q, n = collect_svdquant_lora(
+            q, n, d = collect_svdquant_lora(
                 patcher, _load_lora_cached(path), amount, quant_layers, device, dtype,
-                collected, patch_leftover=(i == newest))
+                branch, adapters, patch_leftover=(i == newest))
             if i == newest:
-                quantized, normal = q, n
+                quantized, normal, dequantizing = q, n, d
 
-        # Both guards are about the LoRA this node just added, not the stack total: an
-        # upstream LoRA matching plenty of layers must not excuse this one matching none.
+        # This guard is about the LoRA this node just added, not the stack total: an upstream
+        # LoRA matching plenty of layers must not excuse this one matching none.
         if quantized == 0 and normal == 0:
             raise ValueError(
                 "no layer of {} matched this model ({} quantized layers were available); "
                 "is it a Krea2 LoRA?".format(lora_name, len(quant_layers))
             )
-        if quantized == 0 and quant_layers:
-            raise ValueError(
-                "{} matched {} non-quantized layers but none of the {} quantized ones. "
-                "ComfyUI's normal LoRA path cannot patch a quantized weight, so the blocks "
-                "would silently go unchanged. Check that the LoRA targets "
-                "'[diffusion_model.|transformer.]blocks.N.{{attn,mlp}}.*'.".format(
-                    lora_name, normal, len(quant_layers))
-            )
+        # Matching only non-quantized layers is *fine* -- a txtfusion-only adapter is a real
+        # thing (`diffusion_model.txtfusion.projector.diff`), and refusing it would be a bug.
+        # What is worth saying out loud is a patch that does target a quantized weight in a
+        # form with no bypass path, because ComfyUI then rewrites the weight and the delta is
+        # requantized to 4 bits along with it -- exactly what this node exists to avoid.
+        if dequantizing:
+            logging.warning(
+                "[krea2-svdquant] %s: %d quantized layer(s) carry a patch with no bypass "
+                "form (a diff/set patch, or an adapter ComfyUI cannot apply without the "
+                "weight). Those go through dequantize -> add -> requantize, so their delta "
+                "is quantized to 4 bits too.", lora_name, dequantizing)
 
-        for layer, factors in collected.items():
+        for layer in set(branch) | set(adapters):
             module = diffusion_model.get_submodule(layer)
-            l1, l2 = _stack_factors(factors)
+            factors = branch.get(layer)
             patcher.add_object_patch(
                 "diffusion_model.{}.forward".format(layer),
-                _make_lora_forward(module, l1, l2),
+                _make_lora_forward(module, _stack_factors(factors) if factors else None,
+                                   adapters.get(layer, ())),
             )
 
-        logging.info("[krea2-svdquant] LoRA stack %s -> %d quantized layers branched; "
-                     "%s added %d quantized, %d normal layers%s",
-                     [f"{n}@{a:.2f}" for n, a in stack], len(collected), lora_name,
-                     quantized, normal,
+        logging.info("[krea2-svdquant] LoRA stack %s -> %d quantized layers branched "
+                     "(%d via bypass adapters); %s added %d quantized, %d normal layers%s",
+                     [f"{n}@{a:.2f}" for n, a in stack], len(set(branch) | set(adapters)),
+                     len(adapters), lora_name, quantized, normal,
                      " (no-low-rank checkpoint: {} quantized layers carry no svdq branch)"
                      .format(unbranched) if unbranched else "")
         return (patcher,)
