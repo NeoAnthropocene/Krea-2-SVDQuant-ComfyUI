@@ -41,8 +41,10 @@ import folder_paths
 from .svdquant_diag import _CATEGORY, quantized_linears
 from .svdquant_w4a4 import add_low_rank, has_branch
 
-_DOWN_SUFFIXES = (".lora_A.weight", ".lora_down.weight", ".lora.down.weight")
-_UP_SUFFIXES = (".lora_B.weight", ".lora_up.weight", ".lora.up.weight")
+_DOWN_SUFFIXES = (".lora_A.weight", ".lora_down.weight", ".lora.down.weight", ".lora_A", ".lora_down")
+_UP_SUFFIXES = (".lora_B.weight", ".lora_up.weight", ".lora.up.weight", ".lora_B", ".lora_up")
+_LOKR_W1_SUFFIXES = (".lokr_w1", ".lokr_w1.weight", ".lokr_w1_a", ".lokr_w1_a.weight", ".hada_w1", ".hada_w1.weight", ".lokr.down.weight")
+_LOKR_W2_SUFFIXES = (".lokr_w2", ".lokr_w2.weight", ".lokr_w2_a", ".lokr_w2_a.weight", ".hada_w2", ".hada_w2.weight", ".lokr.up.weight")
 _PREFIX = "diffusion_model."
 
 # Reloading a 300 MB LoRA off disk on every graph execution is pure latency when the
@@ -82,37 +84,58 @@ def _split_lora(lora_sd, quant_layers: set[str]):
         return None
 
     for key in list(lora_sd.keys()):
-        for suffixes, slot in ((_DOWN_SUFFIXES, "down"), (_UP_SUFFIXES, "up")):
+        for suffixes, slot in (
+            (_DOWN_SUFFIXES, "down"),
+            (_UP_SUFFIXES, "up"),
+            (_LOKR_W1_SUFFIXES, "lokr_w1"),
+            (_LOKR_W2_SUFFIXES, "lokr_w2"),
+        ):
             name = layer_of(key, suffixes)
             if name is not None and name in quant_layers:
                 pairs.setdefault(name, {})[slot] = lora_sd[key]
                 consumed.add(key)
-                alpha_key = key.rsplit(".lora", 1)[0] + ".alpha"
-                if alpha_key in lora_sd:
+                prefix_key = key.rsplit(".", 1)[0]
+                alpha_key = prefix_key + ".alpha"
+                if alpha_key in lora_sd and alpha_key not in consumed:
                     pairs[name]["alpha"] = float(lora_sd[alpha_key].item())
                     consumed.add(alpha_key)
+                dim_key = prefix_key + ".dim"
+                if dim_key in lora_sd and dim_key not in consumed:
+                    pairs[name]["dim"] = float(lora_sd[dim_key].item())
+                    consumed.add(dim_key)
                 break
 
     leftover = {k: v for k, v in lora_sd.items() if k not in consumed}
     return pairs, leftover
 
 
-def _make_lora_forward(module, l1: torch.Tensor, l2: torch.Tensor):
-    """A forward that is "quantized weight + svdq branch (if any) + this LoRA".
+def _make_lora_forward(module, standard_factors: list[tuple[torch.Tensor, torch.Tensor]],
+                       lokr_factors: list[tuple[torch.Tensor, torch.Tensor, float]]):
+    """A forward that is "quantized weight + svdq branch (if any) + LoRAs".
 
     Built on `module._krea2_forward` rather than `module.forward` so that it composes with
     the svdq branch but never with a previously installed LoRA patch -- each patcher owns
     the whole LoRA stack and rebuilds it from scratch.
-
-    A no-low-rank checkpoint has quantized layers with no branch and therefore no
-    `_krea2_forward`; there the module's own forward already *is* "quantized weight", so it
-    is the right base. Object patches are applied in `patch_model`, after this runs, so what
-    we capture is the unpatched forward either way.
     """
     base = getattr(module, "_krea2_forward", None) or module.forward
+    has_std = len(standard_factors) > 0
+    if has_std:
+        std_l1, std_l2 = _stack_factors(standard_factors)
 
     def forward(x, *args, **kwargs):
-        return add_low_rank(base(x, *args, **kwargs), x, l1, l2)
+        y = base(x, *args, **kwargs)
+        if has_std:
+            y = add_low_rank(y, x, std_l1, std_l2)
+        for w1, w2, mult in lokr_factors:
+            a1 = comfy.model_management.cast_to(w1, x.dtype, x.device)
+            a2 = comfy.model_management.cast_to(w2, x.dtype, x.device)
+            orig_shape = x.shape
+            n1, n2 = a1.shape[1], a2.shape[1]
+            m1, m2 = a1.shape[0], a2.shape[0]
+            x_reshaped = x.view(-1, n1, n2)
+            lokr_out = torch.matmul(torch.matmul(a1, x_reshaped), a2.T).view(orig_shape[:-1] + (m1 * m2,))
+            y = y + lokr_out * mult
+        return y
 
     return forward
 
@@ -132,45 +155,65 @@ def _stack_factors(factors: list[tuple[torch.Tensor, torch.Tensor]]):
 
 
 def collect_svdquant_lora(patcher, lora_sd, strength: float, quant_layers: set[str],
-                          device, dtype, into: dict, patch_leftover: bool = True):
-    """Accumulate this LoRA's quantized-layer factors into `into`; patch the rest normally.
+                          device, dtype, into_std: dict, into_lokr: dict, patch_leftover: bool = True):
+    """Accumulate this LoRA's quantized-layer factors into `into_std` and `into_lokr`; patch the rest normally.
 
     `patch_leftover=False` collects the quantized side only and leaves the non-quantized
     layers alone -- see `load_lora` for why the two sides of the stack are handled
     differently.
 
-    Returns the number of layers matched on each path.
+    Returns the number of layers matched on each path and whether any leftover patch
+    targeted a quantized weight.
     """
     pairs, leftover = _split_lora(lora_sd, quant_layers)
 
     applied = 0
     for layer, parts in pairs.items():
-        if "down" not in parts or "up" not in parts:
-            continue
-        rank = int(parts["down"].shape[0])
-        alpha = parts.get("alpha")
-        # `if alpha` would treat a legitimate alpha of 0.0 as "no alpha" and silently run the
-        # layer at full strength instead of disabling it.
-        mult = strength * (float(alpha) / rank if alpha is not None else 1.0)
-        l1 = parts["up"].to(device=device, dtype=dtype)
-        l2 = parts["down"].to(device=device, dtype=dtype) * mult
-        into.setdefault(layer, []).append((l1.contiguous(), l2.contiguous()))
-        applied += 1
+        if "down" in parts and "up" in parts:
+            rank = int(parts["down"].shape[0])
+            alpha = parts.get("alpha")
+            if alpha is None or float(alpha) > 10000.0 or float(alpha) <= 0:
+                mult = strength
+            else:
+                mult = strength * (float(alpha) / rank)
+            l1 = parts["up"].to(device=device, dtype=dtype)
+            l2 = parts["down"].to(device=device, dtype=dtype) * mult
+            into_std.setdefault(layer, []).append((l1.contiguous(), l2.contiguous()))
+            applied += 1
+        elif "lokr_w1" in parts and "lokr_w2" in parts:
+            w1 = parts["lokr_w1"].to(device=device, dtype=dtype)
+            w2 = parts["lokr_w2"].to(device=device, dtype=dtype)
+            alpha = parts.get("alpha")
+            dim = parts.get("dim")
+            rank = int(dim) if dim is not None else (int(w2.shape[0]) if w2.ndim == 2 else 1)
+            if alpha is None or float(alpha) > 10000.0 or float(alpha) <= 0:
+                mult = strength
+            else:
+                mult = strength * (float(alpha) / rank)
+            into_lokr.setdefault(layer, []).append((w1, w2, mult))
+            applied += 1
 
     if not patch_leftover:
-        return applied, 0
+        return applied, 0, False
 
     # Everything the quantized layers did not claim (txtfusion, etc.) goes through
     # ComfyUI's normal LoRA path.
     patched_normally = 0
+    patched_quantized_normally = False
     if leftover:
         key_map = comfy.lora.model_lora_keys_unet(patcher.model, {})
         loaded = comfy.lora.load_lora(leftover, key_map, log_missing=False)
         if loaded:
             patcher.add_patches(loaded, strength)
             patched_normally = len(loaded)
+            for patch_key in loaded.keys():
+                key_str = str(patch_key)
+                for ql in quant_layers:
+                    if ql in key_str:
+                        patched_quantized_normally = True
+                        break
 
-    return applied, patched_normally
+    return applied, patched_normally, patched_quantized_normally
 
 
 class Krea2SVDQuantLoraLoader:
@@ -234,30 +277,18 @@ class Krea2SVDQuantLoraLoader:
         device = patcher.offload_device
         dtype = patcher.model.get_dtype()
 
-        # The two sides of the stack have to be replayed differently, because the two
-        # mechanisms behind them compose differently:
-        #
-        # * `add_object_patch` is keyed, so writing the whole stack's folded factors for a
-        #   layer *replaces* whatever an upstream node put there. Replaying every entry is
-        #   what makes a strength change exact rather than cumulative.
-        # * `add_patches` *appends*, and `clone()` copies the parent's `patches`. So
-        #   replaying an earlier entry's non-quantized layers adds a second copy on top of
-        #   the one just inherited: chaining two nodes used to apply the first LoRA's
-        #   txtfusion layers twice (measured: 3 patch entries per key instead of 2) while
-        #   its quantized layers stayed correct -- the two halves of one LoRA silently
-        #   running at different strengths.
-        #
-        # So only the newest entry patches normally; earlier ones are already inherited.
-        collected: dict[str, list] = {}
+        collected_std: dict[str, list] = {}
+        collected_lokr: dict[str, list] = {}
         quantized = normal = 0
+        patched_quantized_normally = False
         newest = len(stack) - 1
         for i, (name, amount) in enumerate(stack):
             path = folder_paths.get_full_path_or_raise("loras", name)
-            q, n = collect_svdquant_lora(
+            q, n, pqn = collect_svdquant_lora(
                 patcher, _load_lora_cached(path), amount, quant_layers, device, dtype,
-                collected, patch_leftover=(i == newest))
+                collected_std, collected_lokr, patch_leftover=(i == newest))
             if i == newest:
-                quantized, normal = q, n
+                quantized, normal, patched_quantized_normally = q, n, pqn
 
         # Both guards are about the LoRA this node just added, not the stack total: an
         # upstream LoRA matching plenty of layers must not excuse this one matching none.
@@ -266,26 +297,27 @@ class Krea2SVDQuantLoraLoader:
                 "no layer of {} matched this model ({} quantized layers were available); "
                 "is it a Krea2 LoRA?".format(lora_name, len(quant_layers))
             )
-        if quantized == 0 and quant_layers:
+        if quantized == 0 and patched_quantized_normally:
             raise ValueError(
-                "{} matched {} non-quantized layers but none of the {} quantized ones. "
-                "ComfyUI's normal LoRA path cannot patch a quantized weight, so the blocks "
-                "would silently go unchanged. Check that the LoRA targets "
-                "'diffusion_model.blocks.N.{{attn,mlp}}.*'.".format(
-                    lora_name, normal, len(quant_layers))
+                "{} matched {} non-quantized layers but tried to patch quantized layers "
+                "via ComfyUI's normal LoRA path, which cannot patch a quantized weight. "
+                "Check that the LoRA targets 'diffusion_model.blocks.N.{{attn,mlp}}.*'.".format(
+                    lora_name, normal)
             )
 
-        for layer, factors in collected.items():
+        all_layers = set(collected_std.keys()) | set(collected_lokr.keys())
+        for layer in all_layers:
             module = diffusion_model.get_submodule(layer)
-            l1, l2 = _stack_factors(factors)
+            std_factors = collected_std.get(layer, [])
+            lokr_factors = collected_lokr.get(layer, [])
             patcher.add_object_patch(
                 "diffusion_model.{}.forward".format(layer),
-                _make_lora_forward(module, l1, l2),
+                _make_lora_forward(module, std_factors, lokr_factors),
             )
 
         logging.info("[krea2-svdquant] LoRA stack %s -> %d quantized layers branched; "
                      "%s added %d quantized, %d normal layers%s",
-                     [f"{n}@{a:.2f}" for n, a in stack], len(collected), lora_name,
+                     [f"{n}@{a:.2f}" for n, a in stack], len(all_layers), lora_name,
                      quantized, normal,
                      " (no-low-rank checkpoint: {} quantized layers carry no svdq branch)"
                      .format(unbranched) if unbranched else "")
