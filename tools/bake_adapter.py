@@ -109,18 +109,45 @@ def make_weight_patch(patches: dict, applied: dict):
         # fp32 -- without it this would mutate the caller's tensor.
         merged = tensor.to(torch.float32, copy=True)
         for adapter, strength in entries:
+            # `offset` is None when the patch covers the whole weight; passing 0 makes
+            # ComfyUI subscript it (`offset[0]`) and die -- and it dies on the *last* key,
+            # after the quantizer has already burned a quarter of an hour.
             if isinstance(adapter, comfy.weight_adapter.WeightAdapterBase):
                 merged = adapter.calculate_weight(
-                    merged, key, strength, strength, 0, lambda x: x,
+                    merged, key, strength, strength, None, lambda x: x,
                     intermediate_dtype=torch.float32)
             else:
                 merged = comfy.lora.calculate_weight(
-                    [(strength, adapter, strength, 0, None)], merged, key,
+                    [(strength, adapter, strength, None, None)], merged, key,
                     intermediate_dtype=torch.float32)
         applied[key] = applied.get(key, 0) + len(entries)
         return merged.to(tensor.dtype)
 
     return weight_patch
+
+
+def preflight(src: str, patches: dict) -> None:
+    """Apply one patch of each kind for real, before the quantizer runs for a quarter hour.
+
+    The quantizer processes the block weights first and the plain ones last, so a mistake in
+    how a `diff` patch is applied surfaces only after every layer has been quantized. One
+    tensor per distinct patch type costs a couple of seconds and moves that to the start.
+    """
+    from safetensors import safe_open
+
+    seen = set()
+    probes = []
+    for key, entries in patches.items():
+        kind = tuple(type(a).__name__ for a, _ in entries)
+        if kind not in seen:
+            seen.add(kind)
+            probes.append(key)
+
+    with safe_open(src, framework="pt", device="cpu") as handle:
+        for key in probes:
+            hook = make_weight_patch(patches, {})
+            hook(key, handle.get_tensor(key))
+    print("  preflight ok ({} patch shape(s))".format(len(probes)), flush=True)
 
 
 def main():
@@ -161,6 +188,7 @@ def main():
           flush=True)
     patches = load_patches(keys, prefix, loras)
     applied: dict[str, int] = {}
+    preflight(args.src, patches)
 
     out = args.out
     if out is None:

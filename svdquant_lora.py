@@ -406,6 +406,16 @@ class Krea2SVDQuantLoraLoader:
                                    bypassed.get(layer, ())),
             )
 
+        # The dial is worthless if nobody finds it, and the shape that needs it is exactly
+        # the one we can detect: an adapter running per forward on every block.
+        if bypassed and adapters == ADAPTER_BYPASS:
+            logging.info(
+                "[krea2-svdquant] %d layer(s) run a per-forward adapter (LoKr/LoHa/OFT). "
+                "That is exact but not free -- measured +1.8 s per model call at 1440x1920. "
+                "Set this node's 'adapters' input to %r for the stock loader's speed, or see "
+                "tools/bake_adapter.py to bake it in with no runtime cost at all.",
+                len(bypassed), ADAPTER_BAKE)
+
         logging.info("[krea2-svdquant] LoRA stack %s -> %d quantized layers branched "
                      "(%d via bypass adapters); %s added %d quantized, %d normal layers%s",
                      [f"{n}@{a:.2f}" for n, a, _ in stack], len(set(branch) | set(bypassed)),
