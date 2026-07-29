@@ -500,11 +500,18 @@ def check_act_stats_coverage(stats: dict, keys, prefix: str, ranks: dict) -> Non
 
 def convert(src: str, dst: str, fmt: str, groupsize: int, device: str = "cuda", rank: int = 0,
             refine_iters: int = 100, variant: str = "unknown", progress_cb=None,
-            rank_alloc: str = "uniform", act_stats: str | None = None):
+            rank_alloc: str = "uniform", act_stats: str | None = None,
+            weight_patch=None):
     """Quantize `src` into `dst`. Returns the summary line it printed.
 
     `rank` is a budget, `rank_alloc` decides how it is spread across the eight projection
     types -- see `RANK_ALLOCATIONS`. Non-uniform allocations keep the same total branch bytes.
+
+    `weight_patch(key, tensor) -> tensor` runs on every tensor as it is read, before anything
+    is quantized. `tools/bake_adapter.py` uses it to add a LoRA delta into the high-precision
+    weight, so the low-rank branch is fitted against the *merged* weight rather than the LoRA
+    being requantized on top of a finished checkpoint. Streaming it here rather than writing a
+    merged source out first matters in practice: the bf16 source is 24 GB.
 
     `progress_cb(done, total, message)` is called as layers complete, for callers with a
     progress bar to drive (the ComfyUI node). Errors are `RuntimeError`, never `SystemExit`:
@@ -549,6 +556,8 @@ def convert(src: str, dst: str, fmt: str, groupsize: int, device: str = "cuda", 
                     observed_leaves.add(leaf)
                 if is_target(layer, prefix):
                     w = dequantize_target_weight(handle, layer, device)
+                    if weight_patch is not None:
+                        w = weight_patch(key, w)
                     # A reallocated budget can ask for more rank than the weight has singular
                     # directions (attn.wk is only 1536 wide). `svd_lowrank` clamps internally,
                     # but clamping here too keeps the reported rank honest.
@@ -593,7 +602,10 @@ def convert(src: str, dst: str, fmt: str, groupsize: int, device: str = "cuda", 
                     continue
             if key in stale_companions:
                 continue
-            out[key] = handle.get_tensor(key)
+            value = handle.get_tensor(key)
+            # The non-quantized layers (txtfusion, embeddings) can carry a LoRA too, and they
+            # are the half a bake would otherwise silently drop.
+            out[key] = value if weight_patch is None else weight_patch(key, value)
             kept += 1
 
     gc.collect()

@@ -54,6 +54,14 @@ from .svdquant_w4a4 import add_low_rank, has_branch
 _PREFIX = "diffusion_model."
 _ALT_PREFIX = "transformer."
 
+# What to do with an adapter that cannot fold into the low-rank branch (LoKr, LoHa, OFT).
+# `bypass` computes it every forward and never touches the 4-bit weight; `bake` hands it to
+# ComfyUI, which rewrites the weight once and pays nothing per step. Measured on a 3090 at
+# 1440x1920 with a LoKr on all 224 blocks: bypass costs +1.8 s per model call, bake costs
+# nothing and quantizes the delta to 4 bits along with the weight.
+ADAPTER_BYPASS = "bypass (exact, slower)"
+ADAPTER_BAKE = "bake into the weight (fast, requantizes the delta)"
+
 # Reloading a 300 MB LoRA off disk on every graph execution is pure latency when the
 # usual edit is a strength slider. Keyed on mtime+size so editing the file invalidates.
 _LORA_CACHE: OrderedDict[str, tuple[tuple, dict]] = OrderedDict()
@@ -211,7 +219,7 @@ def _stack_factors(factors: list[tuple[torch.Tensor, torch.Tensor]]):
 
 def collect_svdquant_lora(patcher, lora_sd, strength: float, quant_layers: set[str],
                           device, dtype, into_branch: dict, into_adapters: dict,
-                          patch_leftover: bool = True):
+                          patch_leftover: bool = True, adapter_mode: str = ADAPTER_BYPASS):
     """Route one LoRA: quantized layers into `into_branch`/`into_adapters`, the rest normally.
 
     `patch_leftover=False` collects the quantized side only and leaves the non-quantized
@@ -233,13 +241,17 @@ def collect_svdquant_lora(patcher, lora_sd, strength: float, quant_layers: set[s
             continue
         factors = _plain_lora_factors(patch, strength, device, dtype)
         if factors is not None:
+            # A plain LoRA folds into the branch for free in either mode -- one pair of
+            # GEMMs for the whole stack -- so `bake` has nothing to win here.
             into_branch.setdefault(layer, []).append(factors)
-        elif isinstance(patch, comfy.weight_adapter.WeightAdapterBase) and _supports_bypass(patch):
+        elif (adapter_mode == ADAPTER_BYPASS
+              and isinstance(patch, comfy.weight_adapter.WeightAdapterBase)
+              and _supports_bypass(patch)):
             into_adapters.setdefault(layer, []).append((patch, strength))
         else:
-            # A `diff`/`set`/`bias` patch, or an adapter with no bypass form. ComfyUI can
-            # still apply it, but only by rewriting the weight, so the LoRA delta goes
-            # through 4-bit quantization along with it.
+            # `bake` mode, a `diff`/`set`/`bias` patch, or an adapter with no bypass form.
+            # ComfyUI can still apply it, but only by rewriting the weight, so the LoRA
+            # delta goes through 4-bit quantization along with it.
             leftover[model_key] = patch
             dequantizing += 1
             continue
@@ -279,7 +291,19 @@ class Krea2SVDQuantLoraLoader:
                                "the LoRA. Chain more of these nodes to stack LoRAs - the "
                                "whole stack is rebuilt each time, so strengths stay exact.",
                 }),
-            }
+            },
+            "optional": {
+                "adapters": ([ADAPTER_BYPASS, ADAPTER_BAKE], {
+                    "default": ADAPTER_BYPASS,
+                    "tooltip": "Only affects LoRAs that cannot fold into the low-rank branch "
+                               "(LoKr, LoHa, OFT); a plain LoRA is free either way. 'bypass' "
+                               "computes the adapter every forward and never touches the "
+                               "4-bit weight. 'bake' hands it to ComfyUI, which rewrites the "
+                               "weight once: no per-step cost, but the delta is quantized to "
+                               "4 bits with it. Measured with a LoKr at 1440x1920: bypass "
+                               "+1.8 s per model call, bake +0.",
+                }),
+            },
         }
 
     RETURN_TYPES = ("MODEL",)
@@ -291,17 +315,20 @@ class Krea2SVDQuantLoraLoader:
     DESCRIPTION = ("Applies a LoRA to a Krea2 W4A4 quantized model as a parallel low-rank "
                    "branch, leaving the 4-bit weight untouched. The stock loader has to "
                    "dequantize, add and requantize, which puts the LoRA delta through 4-bit "
-                   "quantization along with the weight.")
+                   "quantization along with the weight. LoKr/LoHa/OFT cannot fold into the "
+                   "branch and run per-forward instead; the 'adapters' input trades that "
+                   "exactness back for the stock loader's speed.")
 
-    def load_lora(self, model, lora_name, strength):
+    def load_lora(self, model, lora_name, strength, adapters=ADAPTER_BYPASS):
         if strength == 0:
             return (model,)
         patcher = model.clone()
 
         # Re-apply the whole stack from scratch rather than appending to whatever the
         # upstream node left behind. That keeps this node idempotent when a strength
-        # changes, and still stacks correctly when nodes are chained.
-        stack = list(getattr(model, "krea2_lora_stack", [])) + [(lora_name, strength)]
+        # changes, and still stacks correctly when nodes are chained. The mode rides along
+        # per entry, so chaining a `bypass` LoRA and a `bake` one keeps each one's choice.
+        stack = list(getattr(model, "krea2_lora_stack", [])) + [(lora_name, strength, adapters)]
         patcher.krea2_lora_stack = stack
 
         diffusion_model = patcher.model.diffusion_model
@@ -335,14 +362,14 @@ class Krea2SVDQuantLoraLoader:
         #
         # So only the newest entry patches normally; earlier ones are already inherited.
         branch: dict[str, list] = {}
-        adapters: dict[str, list] = {}
+        bypassed: dict[str, list] = {}
         quantized = normal = dequantizing = 0
         newest = len(stack) - 1
-        for i, (name, amount) in enumerate(stack):
+        for i, (name, amount, mode) in enumerate(stack):
             path = folder_paths.get_full_path_or_raise("loras", name)
             q, n, d = collect_svdquant_lora(
                 patcher, _load_lora_cached(path), amount, quant_layers, device, dtype,
-                branch, adapters, patch_leftover=(i == newest))
+                branch, bypassed, patch_leftover=(i == newest), adapter_mode=mode)
             if i == newest:
                 quantized, normal, dequantizing = q, n, d
 
@@ -358,26 +385,31 @@ class Krea2SVDQuantLoraLoader:
         # What is worth saying out loud is a patch that does target a quantized weight in a
         # form with no bypass path, because ComfyUI then rewrites the weight and the delta is
         # requantized to 4 bits along with it -- exactly what this node exists to avoid.
-        if dequantizing:
+        if dequantizing and adapters == ADAPTER_BYPASS:
             logging.warning(
                 "[krea2-svdquant] %s: %d quantized layer(s) carry a patch with no bypass "
                 "form (a diff/set patch, or an adapter ComfyUI cannot apply without the "
                 "weight). Those go through dequantize -> add -> requantize, so their delta "
                 "is quantized to 4 bits too.", lora_name, dequantizing)
+        elif dequantizing:
+            logging.info(
+                "[krea2-svdquant] %s: %d quantized layer(s) baked into the weight on "
+                "request -- no per-step cost, delta quantized to 4 bits with the weight.",
+                lora_name, dequantizing)
 
-        for layer in set(branch) | set(adapters):
+        for layer in set(branch) | set(bypassed):
             module = diffusion_model.get_submodule(layer)
             factors = branch.get(layer)
             patcher.add_object_patch(
                 "diffusion_model.{}.forward".format(layer),
                 _make_lora_forward(module, _stack_factors(factors) if factors else None,
-                                   adapters.get(layer, ())),
+                                   bypassed.get(layer, ())),
             )
 
         logging.info("[krea2-svdquant] LoRA stack %s -> %d quantized layers branched "
                      "(%d via bypass adapters); %s added %d quantized, %d normal layers%s",
-                     [f"{n}@{a:.2f}" for n, a in stack], len(set(branch) | set(adapters)),
-                     len(adapters), lora_name, quantized, normal,
+                     [f"{n}@{a:.2f}" for n, a, _ in stack], len(set(branch) | set(bypassed)),
+                     len(bypassed), lora_name, quantized, normal,
                      " (no-low-rank checkpoint: {} quantized layers carry no svdq branch)"
                      .format(unbranched) if unbranched else "")
         return (patcher,)

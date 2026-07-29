@@ -103,12 +103,32 @@ knows every format and naming convention ComfyUI supports. From there:
 * **a `diff`/`set` patch, or anything with no bypass form** -> ComfyUI's normal path, with a
   warning, because that route rewrites the weight and requantizes the delta to 4 bits
 
-**LoKr is not free at runtime.** Measured on a 3090, 1024x1024, 8 steps, on top of a plain
-LoRA: 1.34 s/step without it, 2.01 s/step with it. That is the Kronecker math, not the
-plumbing -- a `w2` of 1536x1536 across 4 groups is ~38.7 GMAC per layer, ~0.5 s over 224
-layers. Caching the adapter weights on the GPU instead of staging them per call was measured
-and changed nothing (2.01 vs 2.02 s/step), so the loader does not hold that memory. If your
-sampler evaluates the model twice per step (`res_2s` and friends), double the figure.
+**LoKr is not free at runtime, and the `adapters` input is the dial.** The Kronecker math
+is the cost, not the plumbing: a `w2` of 1536x1536 across 4 groups is ~38.7 GMAC per layer,
+~0.5 s over 224 layers. Caching the adapter weights on the GPU instead of staging them per
+call was measured and changed nothing (2.01 vs 2.02 s/step), so the loader does not hold that
+memory. Measured on a 3090 at **1440x1920**, base rank-256 checkpoint, a plain LoRA plus a
+LoKr plus a txtfusion `.diff`:
+
+| how | s/step | what you get |
+|---|---|---|
+| `adapters = bypass` (default) | 5.21 | the 4-bit weight is never touched, LoKr is exact |
+| `adapters = bake` | 3.55 | ComfyUI rewrites the weight once; the LoKr delta is quantized to 4 bits with it |
+| stock `LoraLoaderModelOnly` for everything | 3.22 | same, and the plain LoRA is requantized too |
+| `tools/bake_adapter.py`, LoKr baked before quantization | 3.74* | no adapter at runtime at all, and the branch is refit around the merged weight |
+
+\* that arm still runs one plain LoRA through the exact branch, which is the 0.35 s/step
+between it and the stock row. Baking that one too takes it to the no-LoRA floor of 3.39.
+
+If your sampler evaluates the model twice per step (`res_2s` and friends), double every
+figure -- a user's 6-step `res_2s` graph came to 104 s on `bypass` against 82 s on the stock
+loader, which is exactly this table times fourteen model calls.
+
+**Which to use.** Occasional LoKr, quality first: leave it on `bypass`. Swapping LoKrs
+constantly: `bake`. Always the same LoKr: bake it into a checkpoint once with
+`tools/bake_adapter.py` -- it adds the delta to the **bf16** weight and then runs the
+SVDQuant split, so the low-rank branch is fitted against the merged weight instead of the
+LoRA being requantized on top of a finished checkpoint.
 
 Two more consequences worth knowing:
 
