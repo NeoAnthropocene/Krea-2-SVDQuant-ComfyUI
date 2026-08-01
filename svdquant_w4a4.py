@@ -373,6 +373,7 @@ def load_svdquant_w4a4(path: str, model_options: dict | None = None,
         raise RuntimeError("could not detect a model in {}".format(path))
 
     diffusion_model = patcher.model.diffusion_model
+    model_dtype = patcher.model.get_dtype()
     attached = 0
     via_op = 0
     ranks: set[int] = set()
@@ -383,6 +384,18 @@ def load_svdquant_w4a4(path: str, model_options: dict | None = None,
             continue
         submodule_path = layer[len(layer_prefix):] if layer_prefix else layer
         base = _get_submodule(diffusion_model, submodule_path)
+        # Store the factors in the dtype the model computes in. `add_low_rank` casts to
+        # `x.dtype` on every call, and the checkpoint holds bf16 while ComfyUI runs this model
+        # in fp16 on anything that cannot do bf16 in tensor cores -- Turing especially, but it
+        # is what our own 3090 picks too. That mismatch is a full conversion of both factors
+        # per layer per forward: measured 0.060 ms per layer at rank 256, 13.5 ms per step
+        # across the 224, ~1.6% of a step. Converting once at load makes the per-call cast a
+        # no-op. Same 2 bytes per element either way, so nothing in the memory accounting
+        # moves; a model re-saved out of ComfyUI now writes fp16 factors, which the loader
+        # reads back identically.
+        if parts["l1"].dtype != model_dtype:
+            parts["l1"] = parts["l1"].to(model_dtype)
+            parts["l2"] = parts["l2"].to(model_dtype)
         if compile_safe:
             # The op keeps the layer inside the graph; the shield takes it out of one. Only
             # one of the two can be installed, and the op is tried first.
