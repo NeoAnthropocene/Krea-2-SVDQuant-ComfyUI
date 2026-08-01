@@ -87,6 +87,10 @@ except Exception as exc:  # pragma: no cover - depends on the ComfyUI build
     get_layout_class = None
     QUANT_UNAVAILABLE = "{}: {}".format(type(exc).__name__, exc)
 
+# Relative improvement the refinement loop must keep making to earn another iteration. See
+# `svdquant_split` for the traced numbers this default comes from.
+REFINE_TOL = 0.001
+
 _QUANT_SUFFIXES = ("attn.wq", "attn.wk", "attn.wv", "attn.gate", "attn.wo",
                    "mlp.gate", "mlp.up", "mlp.down")
 
@@ -342,7 +346,8 @@ def _act_weighting(act_rms: torch.Tensor | None, in_features: int, device, floor
 
 
 def svdquant_split(weight: torch.Tensor, rank: int, fmt: str, groupsize: int,
-                   refine_iters: int = 100, act_rms: torch.Tensor | None = None):
+                   refine_iters: int = 100, act_rms: torch.Tensor | None = None,
+                   refine_tol: float = REFINE_TOL):
     """SVDQuant ordering: pull a low-rank bf16 branch out of W, quantize the residual.
 
     The low-rank branch absorbs the outlier-heavy directions, so the part that has to
@@ -357,6 +362,21 @@ def svdquant_split(weight: torch.Tensor, rank: int, fmt: str, groupsize: int,
     Iteration one is exactly that single-shot split and the best is kept, so refining
     can only match or beat it. Measured on Krea2 Turbo, rank 64: ~10% less
     reconstruction error, every layer improving.
+
+    `refine_tol` is what stops it, and it is *relative* for a reason. It used to be an
+    absolute `1e-6` against an error of order 1e-1, so the loop only stopped when an
+    iteration failed to improve by one part in a hundred thousand -- which measured at a mean
+    of **79.8 of the 100 iterations** across a sample of twelve layers at rank 256. What those
+    iterations buy, traced per iteration on the same layers:
+
+        stop at              iterations   reconstruction error
+        1e-6 absolute (old)     ~80        baseline
+        0.5% relative            ~9        +4.3%
+        0.1% relative (now)     ~22        +2.0%
+
+    Conversion goes from ~14 minutes to ~4. The 2% is reconstruction error, which this repo
+    has three times measured to be a poor predictor of image outcome (see `--rank-alloc` in
+    the README), so read it as a conversion-time change rather than a quality one.
 
     The objective is weight reconstruction error, which needs no calibration data.
     That is the true output error under the assumption that the input covariance is
@@ -410,7 +430,7 @@ def svdquant_split(weight: torch.Tensor, rank: int, fmt: str, groupsize: int,
         # split rather than the best one.
         if not math.isfinite(err):
             break
-        if best is not None and err >= best_err - 1e-6:
+        if best is not None and err >= best_err * (1.0 - refine_tol):
             break  # refinement has stopped paying off
         best_err, best = err, (residual, l1, l2)
 
@@ -501,7 +521,7 @@ def check_act_stats_coverage(stats: dict, keys, prefix: str, ranks: dict) -> Non
 def convert(src: str, dst: str, fmt: str, groupsize: int, device: str = "cuda", rank: int = 0,
             refine_iters: int = 100, variant: str = "unknown", progress_cb=None,
             rank_alloc: str = "uniform", act_stats: str | None = None,
-            weight_patch=None):
+            weight_patch=None, refine_tol: float = REFINE_TOL):
     """Quantize `src` into `dst`. Returns the summary line it printed.
 
     `rank` is a budget, `rank_alloc` decides how it is spread across the eight projection
@@ -572,7 +592,7 @@ def convert(src: str, dst: str, fmt: str, groupsize: int, device: str = "cuda", 
                         # a None here cannot happen for a branched layer.
                         act = stats.get(layer[len(prefix):] if prefix else layer)
                         split = svdquant_split(w, leaf_rank, fmt, groupsize, refine_iters,
-                                               act_rms=act)
+                                               act_rms=act, refine_tol=refine_tol)
                         if split is None:
                             print("  warning: {} is degenerate (zero or non-finite); "
                                   "quantizing it without a low-rank branch".format(layer),
@@ -762,7 +782,14 @@ def main():
     ap.add_argument("--refine-iters", type=int, default=100,
                     help="svdq only: refine the low-rank branch against the quantization "
                          "error, keeping the best (0 = plain single-shot SVD, much faster "
-                         "but ~10%% more reconstruction error)")
+                         "but ~10%% more reconstruction error). This is a cap; --refine-tol "
+                         "is what usually stops the loop first")
+    ap.add_argument("--refine-tol", type=float, default=REFINE_TOL, metavar="FRACTION",
+                    help="svdq only: stop refining a layer once an iteration improves its "
+                         "reconstruction error by less than this fraction (default %(default)s "
+                         "= 0.1%%). Lower means more iterations for less return: 0.001 takes "
+                         "~22 iterations per layer, 0.005 takes ~9 for 2%% more error, and 0 "
+                         "restores the old behaviour of running nearly all --refine-iters")
     ap.add_argument("--variant", choices=["turbo", "base", "unknown"], default="unknown",
                     help="which Krea 2 release this is. Only affects the output filename "
                          "and the recorded metadata -- quantization is identical for both, "
@@ -803,7 +830,8 @@ def main():
             print(note, flush=True)
     try:
         convert(args.src, out, fmt, args.groupsize, args.device, rank, args.refine_iters,
-                variant=args.variant, rank_alloc=args.rank_alloc, act_stats=args.act_stats)
+                variant=args.variant, rank_alloc=args.rank_alloc, act_stats=args.act_stats,
+                refine_tol=args.refine_tol)
     except RuntimeError as exc:
         raise SystemExit(str(exc)) from None
 
