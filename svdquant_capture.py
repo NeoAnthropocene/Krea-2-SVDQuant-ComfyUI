@@ -129,6 +129,21 @@ def write(path: str) -> dict:
         tensors[name] = rms.contiguous()
 
     counts = [e["count"] for e in _STATS.values()]
+    # Every target layer is called exactly once per forward and sees the same token count, so
+    # a clean capture ends with all 224 counts identical -- our own reference run was
+    # 264200/264200. A spread means some layers accumulated activations the others did not,
+    # and there is one way that happens: `detach()` only runs from the Save node, so a graph
+    # that errors between Start and Save leaves the hooks live, and whatever is generated
+    # before the next Start lands in here. `attach()` detaches first, which bounds the window
+    # but does not clear what was already added. Loud, not fatal: the statistics are still
+    # usable, just no longer only about what you meant to calibrate on.
+    if min(counts) != max(counts):
+        logging.warning(
+            "[krea2-svdquant] uneven token counts across layers (%d to %d). Capture stayed "
+            "live through something other than the calibration run -- most likely a graph "
+            "that errored between the Start and Save nodes. Re-run the capture with "
+            "reset=True on the first prompt if these statistics are meant to describe one "
+            "model.", min(counts), max(counts))
     metadata = {
         "krea2_actstats_version": str(FILE_VERSION),
         "krea2_actstats_layers": str(len(tensors)),
